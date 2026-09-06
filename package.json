@@ -1,0 +1,52 @@
+{
+  "name": "codex-copilot-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local Responses-compatible proxy for Codex with Copilot and relay backends",
+  "type": "module",
+  "license": "UNLICENSED",
+  "engines": {
+    "bun": ">=1.3.14"
+  },
+  "scripts": {
+    "start": "bun run server.ts",
+    "auth": "bun run copilot-auth.ts",
+    "refresh": "bun run picker-guard.ts --force",
+    "codex": "bun run codex.ts",
+    "setup": "bun run setup.ts",
+    "test": "bun test"
+  },
+  "files": [
+    ".bun-version",
+    ".env.example",
+    ".gitignore",
+    "README.md",
+    "PROVENANCE.md",
+    "package.json",
+    "server.ts",
+    "server.integration.test.ts",
+    "responses-bridge.ts",
+    "responses-bridge.test.ts",
+    "upload-gate.ts",
+    "upload-gate.test.ts",
+    "model-catalog.ts",
+    "model-catalog.test.ts",
+    "request-body-limit.ts",
+    "request-body-limit.test.ts",
+    "request-body-limit.harness.test.ts",
+    "copilot-auth.ts",
+    "copilot-auth.test.ts",
+    "picker-guard.ts",
+    "picker-guard.sh",
+    "picker-guard.test.ts",
+    "models-template.json",
+    "codex.ts",
+    "codex.test.ts",
+    "setup.ts",
+    "setup.test.ts",
+    "distribution.test.ts",
+    "tools/install-codex.sh",
+    "tools/LICENSE.codex",
+    "tools/NOTICE.codex"
+  ]
+}
