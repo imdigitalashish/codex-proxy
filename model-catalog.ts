@@ -22,6 +22,7 @@ export const isUsablePickerModel = (entry: CatalogEntry) =>
   entry.picker && entry.toolCalls && (supportsResponses(entry) || supportsChatCompletions(entry));
 
 const inferenceEfforts = ["low", "medium", "high", "xhigh", "max"];
+const harnessUltraModels = new Set(["gpt-6-astra", "gpt-5.6-sol-fast"]);
 const effortLabels: Record<string, string> = {
   low: "Fast responses with lighter reasoning",
   medium: "Balances speed and reasoning depth",
@@ -70,7 +71,7 @@ export function buildCodexModels(
       tool_mode: null, use_responses_lite: false, supports_reasoning_summary_parameter: false,
       apply_patch_tool_type: "freeform", supports_search_tool: false, web_search_tool_type: "text",
     });
-    if (id === "gpt-6-astra" && openai && native && efforts.length) {
+    if (harnessUltraModels.has(id) && openai && native && efforts.length) {
       // Ultra selects proactive V2 instructions locally; Codex sends this real effort to the API.
       clone.multi_agent_version = "v2";
       clone.multi_agent_reasoning_effort = inferenceEfforts.findLast((effort) => efforts.includes(effort));

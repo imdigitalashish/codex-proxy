@@ -14,7 +14,7 @@ const apiModel = (id: string, vendor = "OpenAI", endpoint = "/responses") => ({
   },
 });
 const rawCatalog = { data: [
-  apiModel("gpt-5.4-mini"), apiModel("gpt-5.6-sol"), apiModel("gpt-6-astra"),
+  apiModel("gpt-5.4-mini"), apiModel("gpt-5.6-sol"), apiModel("gpt-6-astra"), apiModel("gpt-5.6-sol-fast"),
   apiModel("claude-opus-5", "Anthropic", "/chat/completions"),
 ] };
 let home: string;
@@ -126,18 +126,20 @@ const post = (body: unknown, headers: Record<string, string> = {}) => fetch(`${b
 describe("proxy HTTP integration", () => {
   test("serves Codex Ultra metadata while leaving the raw API catalog unchanged", async () => {
     const codex = await (await fetch(`${baseUrl}/v1/models`, { headers: { "user-agent": "codex-test" } })).json();
-    for (const slug of ["gpt-5.6-sol", "gpt-6-astra"]) {
+    for (const slug of ["gpt-5.6-sol", "gpt-6-astra", "gpt-5.6-sol-fast"]) {
       const model = codex.models.find((item: any) => item.slug === slug);
       expect(model.multi_agent_version).toBe("v2");
       expect(model.supported_reasoning_levels.map((level: any) => level.effort)).toContain("ultra");
     }
-    expect(codex.models.find((item: any) => item.slug === "gpt-6-astra").multi_agent_reasoning_effort).toBe("max");
+    for (const slug of ["gpt-6-astra", "gpt-5.6-sol-fast"]) {
+      expect(codex.models.find((item: any) => item.slug === slug).multi_agent_reasoning_effort).toBe("max");
+    }
     expect(await (await fetch(`${baseUrl}/v1/models`)).json()).toEqual(rawCatalog);
   });
 
-  test("preserves native effort, proactive instructions, and namespaced collaboration tools", async () => {
+  test.each(["gpt-6-astra", "gpt-5.6-sol-fast"])("preserves %s native effort, proactive instructions, and namespaced collaboration tools", async (model) => {
     const body = {
-      model: "gpt-6-astra", reasoning: { effort: "max" }, stream: false,
+      model, reasoning: { effort: "max" }, stream: false,
       input: [{ role: "developer", content: [{ type: "input_text", text: "<multi_agent_mode>Proactive multi-agent delegation is active.</multi_agent_mode>" }] }],
       tools: [{ type: "namespace", name: "collaboration", tools: [{ type: "function", name: "spawn_agent", parameters: { type: "object", properties: {} } }] }],
     };
@@ -147,15 +149,15 @@ describe("proxy HTTP integration", () => {
     expect(captured).toEqual([{ path: "/v1/responses", body }]);
   });
 
-  test("passes native streaming responses through unchanged", async () => {
-    const response = await post({ model: "gpt-6-astra", reasoning: { effort: "max" }, input: "hello", stream: true });
+  test.each(["gpt-6-astra", "gpt-5.6-sol-fast"])("passes %s native streaming responses through unchanged", async (model) => {
+    const response = await post({ model, reasoning: { effort: "max" }, input: "hello", stream: true });
     expect(response.headers.get("content-type")).toContain("text/event-stream");
     expect(await response.text()).toContain('"type":"response.completed"');
     expect(captured).toHaveLength(1);
   });
 
-  test("surfaces upstream validation errors without silently changing the requested effort", async () => {
-    const response = await post({ model: "gpt-6-astra", reasoning: { effort: "ultra" }, input: "hello" });
+  test.each(["gpt-6-astra", "gpt-5.6-sol-fast"])("surfaces %s upstream validation errors without silently changing the requested effort", async (model) => {
+    const response = await post({ model, reasoning: { effort: "ultra" }, input: "hello" });
     expect(response.status).toBe(400);
     expect((await response.json()).error.code).toBe("invalid_request_body");
     expect(captured).toHaveLength(1);

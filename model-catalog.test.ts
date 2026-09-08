@@ -14,6 +14,7 @@ const entry = (id: string, overrides: Partial<CatalogEntry> = {}): CatalogEntry 
 });
 const options = { aliases: {}, extraPickerModels: ["gpt-6-astra"], pickerBaseSlug: "gpt-5.4-mini" };
 const catalog = (...entries: CatalogEntry[]) => new Map(entries.map((model) => [model.id, model]));
+const ultraModels = ["gpt-6-astra", "gpt-5.6-sol-fast"];
 
 describe("Codex harness catalog", () => {
   test("preserves template Ultra and harness metadata even when the API does not advertise Ultra", () => {
@@ -29,33 +30,48 @@ describe("Codex harness catalog", () => {
     expect(result[0]).not.toBe(models[0]);
   });
 
-  test("Astra gets a distinct Ultra picker option, V2, and a valid API mapping without changing its default", () => {
-    const upstream = catalog(entry("gpt-5.4-mini"), entry("gpt-6-astra"));
+  test.each(ultraModels)("%s gets a distinct Ultra picker option, V2, and a valid API mapping without changing its default", (id) => {
+    const upstream = catalog(entry("gpt-5.4-mini"), entry(id));
     const template = { models: [base()] };
     const snapshot = structuredClone(template);
     const result = buildCodexModels(template, upstream, options);
-    const astra = result.find((model) => model.slug === "gpt-6-astra");
-    expect(astra).toMatchObject({
+    const model = result.find((model) => model.slug === id);
+    expect(model).toMatchObject({
       multi_agent_version: "v2", multi_agent_reasoning_effort: "max",
       default_reasoning_level: "medium", tool_mode: null, use_responses_lite: false,
       visibility: "list", context_window: 400000, max_context_window: 1000000,
     });
-    expect(astra.supported_reasoning_levels.map((level: any) => level.effort)).toEqual([...levels, "ultra"]);
-    expect(upstream.get("gpt-6-astra")?.efforts).toEqual(levels);
+    expect(model.supported_reasoning_levels.map((level: any) => level.effort)).toEqual([...levels, "ultra"]);
+    expect(upstream.get(id)?.efforts).toEqual(levels);
     expect(template).toEqual(snapshot);
-    expect(result.filter((model) => model.slug === "gpt-6-astra")).toHaveLength(1);
+    expect(result.filter((model) => model.slug === id)).toHaveLength(1);
   });
 
-  test("Astra's API mapping follows available effort capabilities rather than assuming max", () => {
-    const result = buildCodexModels({ models: [base()] }, catalog(entry("gpt-6-astra", { efforts: ["low", "high"] })), options);
+  test.each(ultraModels)("%s API mapping follows available effort capabilities rather than assuming max", (id) => {
+    const result = buildCodexModels({ models: [base()] }, catalog(entry(id, { efforts: ["low", "high"] })), options);
     expect(result[0].multi_agent_reasoning_effort).toBe("high");
     expect(result[0].supported_reasoning_levels.map((level: any) => level.effort)).toEqual(["low", "high", "ultra"]);
+  });
+
+  test.each(ultraModels)("%s requires native OpenAI inference capabilities before enabling Ultra", (id) => {
+    for (const overrides of [
+      { vendor: "Anthropic" },
+      { endpoints: ["/chat/completions"] },
+      { efforts: ["none"] },
+    ]) {
+      const result = buildCodexModels({ models: [base()] }, catalog(entry(id, overrides)), options);
+      expect(result[0].supported_reasoning_levels.some((level: any) => level.effort === "ultra")).toBe(false);
+      expect(result[0].multi_agent_version).toBeUndefined();
+      expect(result[0].multi_agent_reasoning_effort).toBeUndefined();
+    }
   });
 
   test("does not invent Ultra for other generated models or models without supported inference efforts", () => {
     const result = buildCodexModels({ models: [base()] }, catalog(
       entry("claude-opus-5", { vendor: "Anthropic", endpoints: ["/chat/completions"] }),
       entry("gpt-6-astra", { efforts: [] }),
+      entry("gpt-5.6-sol-fast", { efforts: [] }),
+      entry("gpt-5.6-sol-fast-preview"),
       entry("gpt-5.6-luna"),
     ), options);
     for (const model of result) {
