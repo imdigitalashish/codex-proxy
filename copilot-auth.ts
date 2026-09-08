@@ -1,20 +1,25 @@
 // GitHub device-flow login for the Copilot proxy. Prints a code for you to enter at github.com/login/device,
-// then saves the GitHub OAuth token to ~/.codex-proxy/github-token (mode 600). Never asks for a password.
+// then saves the token privately (POSIX 0600 / Windows user+SYSTEM ACL). Never asks for a password.
 import { mkdir, open, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { protectWindowsPath } from "./windows.ts";
 
 const CLIENT_ID = "Iv1.b507a08c87ecfe98"; // GitHub Copilot's VS Code client id (device flow)
 const H = { "content-type": "application/json", accept: "application/json", "user-agent": "GitHubCopilotChat/0.26.7" };
 
 export async function writePrivateAuthFile(path: string, contents: string): Promise<void> {
   const parent = dirname(path);
-  await mkdir(parent, { recursive: true, mode: 0o700 });
+  const created = await mkdir(parent, { recursive: true, mode: 0o700 });
+  if (created) await protectWindowsPath(created);
   // Replacing a private temporary file avoids exposing partial writes or following an existing token symlink.
   const temporary = join(parent, `.${basename(path)}.${crypto.randomUUID()}.tmp`);
   const file = await open(temporary, "wx", 0o600);
   try {
-    try { await file.writeFile(contents, "utf8"); }
+    try {
+      await protectWindowsPath(temporary);
+      await file.writeFile(contents, "utf8");
+    }
     finally { await file.close(); }
     await rename(temporary, path);
   } finally {

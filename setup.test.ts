@@ -1,8 +1,11 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { install, parseArgs, parsePort, renderServiceDefinitions, type InstallOptions } from "./setup.ts";
+import { expectPrivatePermissions } from "./test-support/helpers.ts";
+
+if (process.platform === "win32") setDefaultTimeout(60_000);
 
 const temporary: string[] = [];
 afterEach(async () => {
@@ -84,10 +87,10 @@ describe("portable setup", () => {
     expect(await exists(join(f.home, "Library"))).toBe(false);
     expect(result.installedServiceFiles).toEqual([]);
     for (const relative of ["", "logs", "services", "tools"]) {
-      expect((await stat(join(f.installDir, relative))).mode & 0o777).toBe(0o700);
+      await expectPrivatePermissions(join(f.installDir, relative), 0o700);
     }
-    expect((await stat(join(f.installDir, ".env"))).mode & 0o777).toBe(0o600);
-    expect((await stat(join(f.installDir, "tools/helper.sh"))).mode & 0o777).toBe(0o700);
+    await expectPrivatePermissions(join(f.installDir, ".env"), 0o600);
+    await expectPrivatePermissions(join(f.installDir, "tools/helper.sh"), 0o700);
     const config = Bun.TOML.parse(await readFile(result.snippet, "utf8")) as any;
     expect(config.model_provider).toBe("portable-codex-proxy");
     expect(config.model_catalog_json).toBe(join(f.home, ".codex/models_cache.json"));
@@ -99,7 +102,7 @@ describe("portable setup", () => {
       wire_api: "responses", requires_openai_auth: false, stream_idle_timeout_ms: 300000,
       request_max_retries: 4, stream_max_retries: 10,
     });
-  });
+  }, 20_000);
 
   test("preserves existing .env, credentials, logs, Codex config, and unrelated files across upgrades", async () => {
     const f = await fixture();
@@ -152,7 +155,7 @@ describe("portable setup", () => {
     expect(result.port).toBe(6001);
     expect(await readFile(join(f.installDir, ".env"), "utf8")).toContain("\nPORT=6001\n");
     expect(await readFile(result.snippet, "utf8")).toContain("http://127.0.0.1:6001/v1");
-    expect((await stat(join(f.installDir, ".env"))).mode & 0o777).toBe(0o600);
+    await expectPrivatePermissions(join(f.installDir, ".env"), 0o600);
   });
 
   test("an existing .env without PORT stays untouched and uses the server default", async () => {
@@ -205,7 +208,7 @@ describe("portable setup", () => {
     },
   );
 
-  test.each(["../github-token", "/etc/passwd", "foo/../github-token", ".env", "github-token", "logs/session.log", ".git/config", "services/extra.service"])(
+  test.each(["../github-token", "/etc/passwd", "foo/../github-token", ".env", ".ENV", "github-token", "GitHub-Token", "auth-status.json", "errors/request.json", "logs/session.log", ".git/config", "services/extra.service", "file:stream", "runtime."])(
     "rejects unsafe or private manifest entry %s", async (entry) => {
       const f = await fixture();
       await writeFile(join(f.sourceDir, "package.json"), JSON.stringify({ files: [...f.files, entry] }));
@@ -228,7 +231,7 @@ describe("portable setup", () => {
     const outside = join(f.root, "outside");
     await mkdir(outside);
     await mkdir(f.installDir, { recursive: true });
-    await symlink(outside, join(f.installDir, "tools"));
+    await symlink(outside, join(f.installDir, "tools"), "dir");
     await expect(install(f.options)).rejects.toThrow("Refusing non-directory");
     expect(await readdir(outside)).toEqual([]);
     expect(await readdir(f.installDir)).toEqual(["tools"]);
@@ -256,12 +259,13 @@ describe("portable setup", () => {
   );
 
   test("macOS service definitions escape XML and execute the absolute Bun without a shell", async () => {
-    const f = await fixture('home & <team> "quoted"');
-    const bunExecutable = join(f.root, 'bun & <version> "tool"');
+    const f = await fixture("home & team");
+    const bunExecutable = join(f.root, "bun & tool");
     const result = await install({ ...f.options, bunExecutable, services: true });
     expect(result.installedServiceFiles).toHaveLength(2);
-    for (const path of result.serviceFiles) {
-      const content = await readFile(path, "utf8");
+    const escaped = renderServiceDefinitions({ platform: "darwin", home: '/home & <team> "quoted"',
+      codexHome: f.home, installDir: f.installDir, bunExecutable, path: "/usr/bin" });
+    for (const content of Object.values(escaped)) {
       expect(content).toContain("&amp;");
       expect(content).toContain("&lt;team&gt;");
       expect(content).toContain("&quot;quoted&quot;");
@@ -284,7 +288,7 @@ describe("portable setup", () => {
   });
 
   test("Linux unit paths preserve spaces, quotes, backslashes, percent signs, and dollars", async () => {
-    const f = await fixture('home with %h $USER "quotes" \\backslash');
+    const f = await fixture("home with %h $USER");
     const bunExecutable = join(f.root, "bun %i $HOME");
     const result = await install({ ...f.options, platform: "linux", bunExecutable, services: true });
     expect(result.installedServiceFiles).toHaveLength(3);
@@ -295,8 +299,10 @@ describe("portable setup", () => {
     expect(command).toStartWith('ExecStart=:"');
     expect(command).toContain("%%i $HOME");
     expect(command).toContain("%%h $USER");
-    expect(command).toContain('\\"quotes\\"');
-    expect(command).toContain("\\\\backslash");
+    const escaped = renderServiceDefinitions({ platform: "linux", home: f.home, codexHome: f.home,
+      installDir: '/home "quotes" \\backslash', bunExecutable, path: "/usr/bin" });
+    expect(escaped["codex-proxy.service"]).toContain('\\"quotes\\"');
+    expect(escaped["codex-proxy.service"]).toContain("\\\\backslash");
     expect(command).not.toContain("/bin/sh");
     for (const line of proxy.split("\n").filter((line) => line.startsWith("Environment="))) {
       const value = unquoteUnitWord(line.slice("Environment=".length));
@@ -425,7 +431,8 @@ PROXY_REASONING_EFFORT="high" # custom effort
   test("CLI setup neither activates services nor executes installed runtime scripts", async () => {
     const f = await fixture();
     await writeFile(join(f.sourceDir, "setup.ts"), await readFile(join(import.meta.dir, "setup.ts")));
-    await writeFile(join(f.sourceDir, "package.json"), JSON.stringify({ files: [...f.files, "setup.ts"] }));
+    await writeFile(join(f.sourceDir, "windows.ts"), await readFile(join(import.meta.dir, "windows.ts")));
+    await writeFile(join(f.sourceDir, "package.json"), JSON.stringify({ files: [...f.files, "setup.ts", "windows.ts"] }));
     const bin = join(f.root, "bin");
     const marker = join(f.root, "activation-attempt");
     await mkdir(bin);
@@ -458,7 +465,8 @@ describe("setup validation", () => {
     expect(() => parseArgs(["--home", "--services"])).toThrow("requires a value");
     expect(() => parseArgs(["--services=false"])).toThrow("does not take a value");
     expect(() => parseArgs(["--services", "--services"])).toThrow("Duplicate");
-    expect(() => parseArgs(["--platform=win32"])).toThrow("Unsupported platform");
+    expect(parseArgs(["--platform=win32"])).toEqual({ platform: "win32" });
+    expect(() => parseArgs(["--platform=unsupported"])).toThrow("Unsupported platform");
     expect(() => parseArgs(["--start"])).toThrow("Unknown option");
     expect(parsePort("65535")).toBe(65535);
     expect(parsePort("1")).toBe(1);

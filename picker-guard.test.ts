@@ -1,8 +1,14 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { refreshPickerCache } from "./picker-guard";
+import { cleanupMockCodex, expectPrivatePermissions, fakeCodex } from "./test-support/helpers.ts";
+
+afterAll(cleanupMockCodex);
+// This suite launches multiple native clients per case. Its timeout regression
+// tests still use explicit 20 ms deadlines for the operations under test.
+if (process.platform === "win32") setDefaultTimeout(60_000);
 
 let home: string;
 let models: any[];
@@ -22,9 +28,7 @@ beforeEach(async () => {
   await mkdir(join(home, ".codex"));
   await mkdir(join(home, ".codex-proxy"));
   cachePath = join(home, ".codex", "models_cache.json");
-  codexPath = join(home, "codex");
-  await Bun.write(codexPath, "#!/bin/sh\nprintf 'codex-cli 0.153.0-alpha.5\\n'\n");
-  await chmod(codexPath, 0o700);
+  codexPath = await fakeCodex(join(home, "codex"), { version: "0.153.0-alpha.5" });
   models = Array.from({ length: 10 }, (_, index) => ({
     slug: `model-${index}`, priority: index, supported_reasoning_levels: [{ effort: "max", description: "Maximum" }],
   }));
@@ -42,7 +46,7 @@ beforeEach(async () => {
       return malformed ? new Response("not JSON", { status }) : Response.json({ models }, { status });
     },
   });
-});
+}, 30_000);
 
 afterEach(async () => {
   server.stop(true);
@@ -89,7 +93,7 @@ describe("picker cache refresh", () => {
       models, client_version: "0.153.0", etag: 'W/"local-proxy-extended"',
     });
     expect(userAgent).toBe("codex_cli_rs/0.153.0");
-    expect((await stat(cachePath)).mode & 0o777).toBe(0o600);
+    await expectPrivatePermissions(cachePath, 0o600);
   });
 
   test("refreshes fresh, same-count catalogs when Ultra or harness metadata changes", async () => {
@@ -199,8 +203,8 @@ describe("picker cache refresh", () => {
     })).toEqual({ code: 0, output: "", errors: "" });
     const customCache = join(customHome, "models_cache.json");
     expect((await Bun.file(customCache).json()).models).toEqual(models);
-    expect((await stat(customHome)).mode & 0o777).toBe(0o700);
-    expect((await stat(customCache)).mode & 0o777).toBe(0o600);
+    await expectPrivatePermissions(customHome, 0o700);
+    await expectPrivatePermissions(customCache, 0o600);
     expect(await Bun.file(cachePath).exists()).toBe(false);
   });
 
@@ -213,9 +217,7 @@ describe("picker cache refresh", () => {
   });
 
   test("uses an explicit CODEX_BIN outside PATH before picker-specific defaults", async () => {
-    const binary = join(home, "custom codex");
-    await Bun.write(binary, "#!/bin/sh\nprintf 'codex-cli 0.154.4-alpha.2\\n'\n");
-    await chmod(binary, 0o700);
+    const binary = await fakeCodex(join(home, "custom codex"), { version: "0.154.4-alpha.2" });
     expect(await invokeGuard([], {
       CODEX_BIN: binary,
       PATH: "",
@@ -226,8 +228,7 @@ describe("picker cache refresh", () => {
   test("resolves a CODEX_BIN command name on PATH", async () => {
     const bin = join(home, "custom-command-bin");
     await mkdir(bin);
-    await Bun.write(join(bin, "alternate-codex"), "#!/bin/sh\nprintf 'codex-cli 0.154.5\\n'\n");
-    await chmod(join(bin, "alternate-codex"), 0o700);
+    await fakeCodex(join(bin, "alternate-codex"), { version: "0.154.5" });
     expect(await invokeGuard([], {
       CODEX_BIN: "alternate-codex",
       PATH: bin,
@@ -253,19 +254,26 @@ describe("picker cache refresh", () => {
   test("falls back to HOME/.local/bin/codex", async () => {
     const bin = join(home, ".local", "bin");
     await mkdir(bin, { recursive: true });
-    await Bun.write(join(bin, "codex"), "#!/bin/sh\nprintf 'codex-cli 0.154.2\\n'\n");
-    await chmod(join(bin, "codex"), 0o700);
+    await fakeCodex(join(bin, "codex"), { version: "0.154.2" });
     expect(await invokeGuard([], {
       PICKER_GUARD_APP_CODEX: join(home, "missing-app"),
     })).toEqual({ code: 0, output: "", errors: "" });
     expect((await Bun.file(cachePath).json()).client_version).toBe("0.154.2");
   });
 
+  test.skipIf(process.platform !== "win32")("discovers the user-local Windows Codex installation without PATH", async () => {
+    const localAppData = join(home, "AppData", "Local");
+    await fakeCodex(join(localAppData, "Programs", "OpenAI", "Codex", "bin", "codex.exe"), { version: "0.153.4" });
+    expect(await invokeGuard([], {
+      PATH: "", LOCALAPPDATA: localAppData, PICKER_GUARD_APP_CODEX: undefined,
+    })).toEqual({ code: 0, output: "", errors: "" });
+    expect((await Bun.file(cachePath).json()).client_version).toBe("0.153.4");
+  });
+
   test("falls back to PATH without curl, jq, shasum, date, or zsh", async () => {
     const bin = join(home, "only-codex-bin");
     await mkdir(bin);
-    await Bun.write(join(bin, "codex"), "#!/bin/sh\nprintf 'codex-cli 0.154.3-beta.1\\n'\n");
-    await chmod(join(bin, "codex"), 0o700);
+    await fakeCodex(join(bin, "codex"), { version: "0.154.3-beta.1" });
     expect(await invokeGuard([], {
       PATH: bin,
       PICKER_GUARD_APP_CODEX: join(home, "missing-app"),
@@ -274,7 +282,7 @@ describe("picker cache refresh", () => {
     expect((await Bun.file(cachePath).json()).client_version).toBe("0.154.3");
   });
 
-  test("keeps the POSIX shell wrapper usable with an explicit Bun binary", async () => {
+  test.skipIf(process.platform === "win32")("keeps the POSIX shell wrapper usable with an explicit Bun binary", async () => {
     expect(await invokeGuard(["--force"], {
       BUN_BIN: process.execPath,
       PATH: "/usr/bin:/bin",
@@ -289,8 +297,8 @@ describe("picker cache refresh", () => {
       PICKER_GUARD_APP_CODEX: join(home, "missing-app"),
       PICKER_GUARD_CLI_CODEX: join(home, "missing-cli"),
     })).toEqual({ code: 0, output: "", errors: "" });
-    for (const script of ["#!/bin/sh\nexit 1\n", "#!/bin/sh\nprintf 'unknown-version\\n'\n"]) {
-      await Bun.write(codexPath, script);
+    for (const options of [{ exitCode: 1 }, { version: "unknown-version" }]) {
+      await fakeCodex(codexPath, options);
       await runGuard();
     }
     expect(requests).toBe(0);
@@ -299,7 +307,7 @@ describe("picker cache refresh", () => {
 
   test("bounds a stuck Codex version command", async () => {
     const before = await seed();
-    await Bun.write(codexPath, "#!/bin/sh\nwhile :; do :; done\n");
+    await fakeCodex(codexPath, { hang: true });
     expect(await refreshPickerCache({ env: environment(), force: true, versionTimeoutMs: 20 })).toBe(false);
     expect(requests).toBe(0);
     expect(await Bun.file(cachePath).text()).toBe(before);

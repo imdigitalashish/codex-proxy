@@ -1,8 +1,9 @@
 import { chmod, lstat, mkdir, open, readFile, realpath, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { installWindowsTasks, protectWindowsPath, renderWindowsTasks } from "./windows.ts";
 
-export type Platform = "darwin" | "linux";
+export type Platform = "darwin" | "linux" | "win32";
 export type InstallOptions = {
   home?: string;
   sourceDir?: string;
@@ -13,12 +14,13 @@ export type InstallOptions = {
   env?: Record<string, string | undefined>;
 };
 
-const usage = `Usage: bun run setup [--home DIR] [--platform darwin|linux] [--services]
+const usage = `Usage: bun run setup [--home DIR] [--platform darwin|linux|win32] [--services]
 
 Copies the package to HOME/.codex-proxy without changing existing credentials
 or Codex configuration. --services installs user service definitions, but never
 loads, enables, starts, or restarts them. Without it, definitions are only written
-to HOME/.codex-proxy/services. No authentication or network requests are made.
+to HOME/.codex-proxy/services. Windows tasks are registered disabled for the
+current user. No authentication or network requests are made.
 `;
 
 export function parseArgs(args: string[]): InstallOptions & { help?: boolean } {
@@ -47,8 +49,8 @@ export function parseArgs(args: string[]): InstallOptions & { help?: boolean } {
 }
 
 function parsePlatform(value: string): Platform {
-  if (value !== "darwin" && value !== "linux") {
-    throw new Error(`Unsupported platform: ${value}. Use macOS or Linux (including WSL).`);
+  if (value !== "darwin" && value !== "linux" && value !== "win32") {
+    throw new Error(`Unsupported platform: ${value}. Use macOS, Linux, or Windows.`);
   }
   return value;
 }
@@ -106,16 +108,17 @@ async function inspect(path: string) {
 }
 
 function manifestPath(value: unknown): string {
-  if (typeof value !== "string" || !value || /[\\\x00-\x1f\x7f]/.test(value)) {
+  if (typeof value !== "string" || !value || /[\\:*?"<>|\x00-\x1f\x7f]/.test(value)) {
     throw new Error(`Invalid package.files entry: ${JSON.stringify(value)}`);
   }
   const parts = value.split("/");
   if (isAbsolute(value) || parts.some((part) => !part || part === "." || part === "..")) {
     throw new Error(`Unsafe package.files path: ${value}`);
   }
-  if (parts.some((part) =>
+  if (parts.some((part) => /[. ]$/.test(part))) throw new Error(`Unsafe package.files path: ${value}`);
+  if (parts.map((part) => part.toLowerCase()).some((part) =>
     part === ".git" || part === ".env" || (part.startsWith(".env.") && part !== ".env.example") ||
-    part === "github-token" || part === "logs" || part.endsWith(".log") ||
+    part === "github-token" || part === "auth-status.json" || part === "errors" || part === "logs" || part.endsWith(".log") ||
     part === "config.toml" || part === "codex-provider.toml" || part === "services"
   )) {
     throw new Error(`Private or generated state is not distributable: ${value}`);
@@ -178,6 +181,7 @@ export function renderServiceDefinitions(options: {
 }): Record<string, string> {
   const { platform, home, codexHome, installDir, bunExecutable, path } = options;
   for (const [key, value] of Object.entries(options)) safeText(value, key);
+  if (platform === "win32") return renderWindowsTasks(options);
   const environment = { HOME: home, CODEX_HOME: codexHome, PATH: path };
   if (platform === "darwin") {
     function plist(label: string, script: string, log: string, schedule: string) {
@@ -270,6 +274,9 @@ export async function install(options: InstallOptions = {}) {
   const installDir = join(home, ".codex-proxy");
   const sourceDir = await realpath(resolve(options.sourceDir ?? import.meta.dir));
   const platform = parsePlatform(options.platform ?? process.platform);
+  if (platform === "win32" && options.services && process.platform !== "win32") {
+    throw new Error("Windows task registration requires Windows; omit --services to generate definitions only");
+  }
   const bunExecutable = safeText(options.bunExecutable ?? process.execPath, "Bun executable");
   if (!isAbsolute(bunExecutable)) throw new Error("Bun executable must be an absolute path");
   const manifest = JSON.parse(await readFile(join(sourceDir, "package.json"), "utf8"));
@@ -317,19 +324,22 @@ export async function install(options: InstallOptions = {}) {
   }
   const model = modelSetting("PROXY_MODEL", "claude-opus-5");
   const reasoningEffort = modelSetting("PROXY_REASONING_EFFORT", "max");
+  const separator = platform === "win32" ? ";" : ":";
   const path = [...new Set([
     dirname(bunExecutable), join(home, ".local/bin"), join(home, ".bun/bin"),
-    ...(env.PATH ?? "").split(":").filter((entry) => isAbsolute(entry)),
-    "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin",
-  ])].join(":");
+    ...(env.PATH ?? "").split(separator).filter((entry) => isAbsolute(entry)),
+    ...(platform === "win32" ? [] : ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]),
+  ])].join(separator);
   const definitions = renderServiceDefinitions({ platform, home, codexHome, installDir, bunExecutable, path });
   const serviceRelative = platform === "darwin" ? "Library/LaunchAgents" : ".config/systemd/user";
   for (const name of Object.keys(definitions)) {
     await checkPath(installDir, `services/${name}`, "file");
-    if (options.services) await checkPath(home, `${serviceRelative}/${name}`, "file");
+    if (options.services && platform !== "win32") await checkPath(home, `${serviceRelative}/${name}`, "file");
   }
   const sameDirectory = Boolean(await inspect(installDir)) && await realpath(installDir) === sourceDir;
   await privateDirectory(installDir);
+  await protectWindowsPath(installDir);
+  if (envExists) await protectWindowsPath(envFile);
   await privateDirectory(join(installDir, "logs"));
   await privateDirectory(join(installDir, "services"));
   let copiedFiles = 0;
@@ -372,12 +382,15 @@ stream_idle_timeout_ms = 300000
     const definition = join(installDir, "services", name);
     await writeManaged(definition, contents);
     serviceFiles.push(definition);
-    if (options.services) {
+    if (options.services && platform !== "win32") {
       const target = join(home, serviceRelative, name);
       await privateDirectory(dirname(target));
       await writeManaged(target, contents);
       installedServiceFiles.push(target);
     }
+  }
+  if (options.services && platform === "win32") {
+    installedServiceFiles.push(...await installWindowsTasks(definitions));
   }
   return { installDir, codexHome, port, platform, copiedFiles, envCreated: !envExists, snippet, serviceFiles, installedServiceFiles };
 }
@@ -394,7 +407,7 @@ if (import.meta.main) {
       console.log(`Provider snippet: ${result.snippet}`);
       console.log(`Service definitions: ${join(result.installDir, "services")}`);
       if (result.installedServiceFiles.length) {
-        console.log(`User service files installed:\n${result.installedServiceFiles.join("\n")}`);
+        console.log(`User ${result.platform === "win32" ? "tasks registered (existing tasks unchanged)" : "service files installed"}:\n${result.installedServiceFiles.join("\n")}`);
       }
       console.log("No services were enabled, started, or restarted. See README.md for authentication and startup.");
     }

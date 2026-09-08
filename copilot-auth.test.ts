@@ -1,9 +1,12 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { writePrivateAuthFile } from "./copilot-auth.ts";
+import { aclSnapshot, expectPrivatePermissions } from "./test-support/helpers.ts";
+
+if (process.platform === "win32") setDefaultTimeout(60_000);
 
 let home: string;
 const authPath = join(import.meta.dir, "copilot-auth.ts");
@@ -15,17 +18,18 @@ afterEach(async () => { await rm(home, { recursive: true, force: true }); });
 describe("writePrivateAuthFile", () => {
   test("creates private files and missing parents without changing an existing parent", async () => {
     await chmod(home, 0o755);
+    const parentBefore = process.platform === "win32" ? (await aclSnapshot(home)).sddl : await permissions(home);
     const directory = join(home, "custom", "credentials");
     const token = join(directory, "github-token");
     await writePrivateAuthFile(token, "fixture-only-token");
 
     expect(await readFile(token, "utf8")).toBe("fixture-only-token");
-    expect(await permissions(token)).toBe(0o600);
-    expect(await permissions(directory)).toBe(0o700);
-    expect(await permissions(join(home, "custom"))).toBe(0o700);
-    expect(await permissions(home)).toBe(0o755);
+    await expectPrivatePermissions(token, 0o600);
+    await expectPrivatePermissions(directory, 0o700);
+    await expectPrivatePermissions(join(home, "custom"), 0o700);
+    expect(process.platform === "win32" ? (await aclSnapshot(home)).sddl : await permissions(home)).toBe(parentBefore);
     expect(await readdir(directory)).toEqual(["github-token"]);
-  });
+  }, 20_000);
 
   test("overwrites a permissive file atomically without modifying its old inode", async () => {
     const token = join(home, "github-token");
@@ -33,13 +37,14 @@ describe("writePrivateAuthFile", () => {
     await writeFile(token, "old-fixture-token");
     await chmod(token, 0o644);
     await link(token, previous);
+    const previousPermissions = process.platform === "win32" ? (await aclSnapshot(previous)).sddl : await permissions(previous);
 
     await writePrivateAuthFile(token, "new-fixture-token");
 
     expect(await readFile(token, "utf8")).toBe("new-fixture-token");
-    expect(await permissions(token)).toBe(0o600);
+    await expectPrivatePermissions(token, 0o600);
     expect(await readFile(previous, "utf8")).toBe("old-fixture-token");
-    expect(await permissions(previous)).toBe(0o644);
+    expect(process.platform === "win32" ? (await aclSnapshot(previous)).sddl : await permissions(previous)).toBe(previousPermissions);
     expect((await stat(token)).ino).not.toBe((await stat(previous)).ino);
     expect((await readdir(home)).sort()).toEqual(["github-token", "previous-token"]);
   });
@@ -55,7 +60,7 @@ describe("writePrivateAuthFile", () => {
     expect(await readFile(destination, "utf8")).toBe("untouched-fixture");
     expect(await readFile(token, "utf8")).toBe("fixture-only-token");
     expect((await lstat(token)).isSymbolicLink()).toBe(false);
-    expect(await permissions(token)).toBe(0o600);
+    await expectPrivatePermissions(token, 0o600);
   });
 
   test("cleans temporary data when replacement fails", async () => {
@@ -76,7 +81,7 @@ describe("writePrivateAuthFile", () => {
     await expect(writePrivateAuthFile(token, undefined as unknown as string)).rejects.toThrow();
 
     expect(await readFile(token, "utf8")).toBe("previous-fixture-token");
-    expect(await permissions(token)).toBe(0o600);
+    await expectPrivatePermissions(token, 0o600);
     expect(await readdir(home)).toEqual(["github-token"]);
   });
 });
@@ -136,14 +141,14 @@ test("device flow stores private status and a custom token without printing cred
   expect(output).not.toContain("fixture-only-access-token");
   expect(output).not.toContain("fixture-device-code");
   expect(await readFile(token, "utf8")).toBe("fixture-only-access-token");
-  expect(await permissions(token)).toBe(0o600);
-  expect(await permissions(join(home, "custom"))).toBe(0o700);
-  expect(await permissions(join(home, "custom", "credentials"))).toBe(0o700);
+  await expectPrivatePermissions(token, 0o600);
+  await expectPrivatePermissions(join(home, "custom"), 0o700);
+  await expectPrivatePermissions(join(home, "custom", "credentials"), 0o700);
   const statusPath = join(home, ".codex-proxy", "auth-status.json");
   expect(JSON.parse(await readFile(statusPath, "utf8")).state).toBe("authenticated");
-  expect(await permissions(statusPath)).toBe(0o600);
-  expect(await permissions(join(home, ".codex-proxy"))).toBe(0o700);
+  await expectPrivatePermissions(statusPath, 0o600);
+  await expectPrivatePermissions(join(home, ".codex-proxy"), 0o700);
   expect(JSON.parse(await readFile(observations, "utf8"))).toEqual({ polls: 3, delays: [1000, 1000, 6000] });
   expect(await readdir(join(home, ".codex-proxy"))).toEqual(["auth-status.json"]);
   expect(await readdir(join(home, "custom", "credentials"))).toEqual(["github-token"]);
-});
+}, 20_000);

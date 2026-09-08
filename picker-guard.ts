@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import { access, appendFile, mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { protectWindowsPath, watchTaskParent } from "./windows.ts";
 
 type Environment = Record<string, string | undefined>;
 type Model = Record<string, unknown> & { slug: string };
@@ -60,7 +61,9 @@ export async function findCodexBinary(env: Environment = process.env): Promise<s
     appOverride,
     cliOverride,
     !appOverride && process.platform === "darwin" ? "/Applications/ChatGPT.app/Contents/Resources/codex" : undefined,
-    !cliOverride ? join(home, ".local", "bin", "codex") : undefined,
+    !appOverride && process.platform === "win32"
+      ? join(env.LOCALAPPDATA || join(home, "AppData", "Local"), "Programs", "OpenAI", "Codex", "bin", "codex.exe") : undefined,
+    !cliOverride ? join(home, ".local", "bin", process.platform === "win32" ? "codex.exe" : "codex") : undefined,
     env.PATH ? Bun.which("codex", { PATH: env.PATH }) : undefined,
   ];
   for (const candidate of candidates) {
@@ -86,10 +89,12 @@ function clientVersion(binary: string, env: Environment, timeoutMs: number): str
 }
 
 async function replaceCache(path: string, cache: unknown): Promise<void> {
-  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const created = await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  if (created) await protectWindowsPath(created);
   const temporary = `${path}.tmp.${process.pid}.${randomUUID()}`;
   const file = await open(temporary, "wx", 0o600);
   try {
+    await protectWindowsPath(temporary);
     await file.writeFile(`${JSON.stringify(cache, null, 2)}\n`);
     await file.sync();
     await file.close();
@@ -173,6 +178,7 @@ export async function refreshPickerCache({
 }
 
 if (import.meta.main) {
+  watchTaskParent();
   const args = process.argv.slice(2);
   if (args.length > 1 || (args.length === 1 && args[0] !== "--force")) {
     console.error("Usage: picker-guard.ts [--force]");

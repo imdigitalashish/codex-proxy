@@ -10,7 +10,11 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -20,6 +24,8 @@ jobs:
       - name: Test Proxy And Portable Setup
         run: bun test
       - name: Check Picker Shell Syntax
+        if: runner.os != 'Windows'
         run: sh -n picker-guard.sh
       - name: Check Optional Installer Shell Syntax
+        if: runner.os != 'Windows'
         run: sh -n tools/install-codex.sh

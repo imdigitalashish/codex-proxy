@@ -1,8 +1,12 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildCodexCommand } from "./codex.ts";
+import { cleanupMockCodex, fakeCodex } from "./test-support/helpers.ts";
+
+afterAll(cleanupMockCodex);
+if (process.platform === "win32") setDefaultTimeout(60_000);
 
 const temporary: string[] = [];
 afterEach(async () => {
@@ -13,13 +17,9 @@ async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "codex-proxy-launch-"));
   temporary.push(root);
   const home = join(root, "home with spaces");
-  const codexHome = join(home, '.codex "custom"');
+  const codexHome = join(home, process.platform === "win32" ? ".codex 'custom' & [state]" : '.codex "custom"');
   await mkdir(codexHome, { recursive: true });
-  const binary = join(root, "fake codex");
-  await writeFile(binary, `#!${process.execPath}
-console.log(JSON.stringify({ args: process.argv.slice(2), home: process.env.HOME, codexHome: process.env.CODEX_HOME }));
-process.exit(Number(process.env.FAKE_EXIT ?? "0"));
-`, { mode: 0o700 });
+  const binary = await fakeCodex(join(root, "fake codex"), { echoArgs: true });
   await writeFile(join(codexHome, "models_cache.json"), JSON.stringify({ models: [{ slug: "fixture" }] }));
   const config = join(codexHome, "config.toml");
   await writeFile(config, 'model_provider = "existing"\n# keep user configuration\n');
@@ -128,9 +128,11 @@ describe("portable Codex launcher", () => {
       env: { ...f.env, FAKE_EXIT: "7" },
       stdin: "ignore", stdout: "pipe", stderr: "pipe",
     });
+    const output = new Response(child.stdout).json();
+    const errors = new Response(child.stderr).text();
     expect(await child.exited).toBe(7);
-    expect(await new Response(child.stderr).text()).toBe("");
-    const result = await new Response(child.stdout).json() as any;
+    expect(await errors).toBe("");
+    const result = await output as any;
     expect(result.args.slice(-2)).toEqual(["exec", "literal $prompt"]);
     expect(result.home).toBe(f.home);
     expect(result.codexHome).toBe(f.codexHome);

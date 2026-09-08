@@ -1,10 +1,13 @@
-import { expect, test } from "bun:test";
+import { afterAll, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { install, type Platform } from "./setup.ts";
+import { cleanupMockCodex, expectPrivatePermissions, fakeCodex } from "./test-support/helpers.ts";
 
-test.each(["darwin", "linux"] as Platform[])("actual package installs and launches offline for %s", async (platform) => {
+afterAll(cleanupMockCodex);
+
+test.each(["darwin", "linux", "win32"] as Platform[])("actual package installs and launches offline for %s", async (platform) => {
   const root = await mkdtemp(join(tmpdir(), "codex-proxy-distribution-"));
   try {
     const home = join(root, "fresh home with spaces");
@@ -18,13 +21,12 @@ test.each(["darwin", "linux"] as Platform[])("actual package installs and launch
     expect(names).not.toContain("github-token");
     expect(names).not.toContain("auth-status.json");
     expect(names).not.toContain(".git");
-    expect((await stat(join(result.installDir, ".env"))).mode & 0o777).toBe(0o600);
+    await expectPrivatePermissions(join(result.installDir, ".env"), 0o600);
     expect(await readdir(home)).toEqual([".codex-proxy"]);
     const snippet = Bun.TOML.parse(await readFile(result.snippet, "utf8"));
     expect(snippet.model_provider).toBe("portable-codex-proxy");
 
-    const fake = join(root, "fake codex");
-    await writeFile(fake, "#!/bin/sh\nprintf '%s\\n' 'codex-cli fixture'\n", { mode: 0o700 });
+    const fake = await fakeCodex(join(root, "fake codex"), { version: "fixture" });
     const child = Bun.spawn([process.execPath, "run", "codex", "--", "--version"], {
       cwd: result.installDir,
       env: {
@@ -50,4 +52,4 @@ test.each(["darwin", "linux"] as Platform[])("actual package installs and launch
   } finally {
     await rm(root, { recursive: true, force: true });
   }
-});
+}, 20_000);

@@ -3,6 +3,8 @@
 // instructions, message history with text+images, function tools and tool results, Codex "custom" (freeform)
 // tools mapped onto function tools, tool_choice, reasoning effort, JSON schema output, streaming SSE in
 // Responses event format, and usage accounting.
+import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 
 type Json = any;
 const uid = (p: string) => `${p}_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
@@ -32,21 +34,82 @@ function contentToText(c: Json): string {
 
 // Flatten Codex's tool list into plain function tools: namespace containers are expanded, custom (freeform)
 // tools become a function with a single "input" string, and tool types with no equivalent are dropped.
-export type FlatTools = { tools: Json[]; customToolNames: Set<string>; namespaces: Map<string, string>; dropped: string[] };
+type ToolIdentity = { name: string; namespace?: string };
+export type ToolIdentityMap = Map<string, ToolIdentity>;
+export class ToolMappingError extends Error {}
+const TOOL_ALIAS_PREFIX = "_cp_";
+
+function upstreamToolName(name: unknown, namespace?: unknown): string {
+  if (typeof name !== "string" || !name || (namespace != null && (typeof namespace !== "string" || !namespace))) {
+    throw new ToolMappingError("Tool names and namespaces must be nonempty strings");
+  }
+  if (namespace == null && /^[A-Za-z0-9_-]{1,64}$/.test(name) && !name.startsWith(TOOL_ALIAS_PREFIX)) return name;
+  // Independent of tool order or which tools are enabled. The reserved prefix
+  // also escapes root tools that could otherwise impersonate a generated alias.
+  const label = `${namespace == null ? "" : namespace + "__"}${name}`.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 39);
+  const hash = createHash("sha256").update(JSON.stringify([namespace ?? null, name])).digest("hex").slice(0, 20);
+  return `${TOOL_ALIAS_PREFIX}${label}_${hash}`;
+}
+
+function inputToolName(item: Json, identities: ToolIdentityMap, requireKnown = false): string {
+  const name = upstreamToolName(item.name, item.namespace);
+  if (item.namespace == null && !identities.has(name)) {
+    // Older histories can lack namespace metadata. Only infer it when unambiguous.
+    const matches = [...identities].filter(([, identity]) => identity.name === item.name);
+    if (matches.length === 1) return matches[0][0];
+    if (matches.length > 1) throw new ToolMappingError(`Ambiguous tool reference: ${item.name}; a namespace is required`);
+  }
+  if (requireKnown && !identities.has(name)) throw new ToolMappingError(`Unknown or unsupported tool choice: ${item.name}`);
+  return name;
+}
+
+function flattenedToolChoice(choice: Json, identities: ToolIdentityMap): Json {
+  if (typeof choice === "string") return choice;
+  const reference = (tool: Json) => {
+    if (tool?.type !== "function" && tool?.type !== "custom") throw new ToolMappingError("Unsupported tool-choice reference");
+    return { type: "function", name: inputToolName(tool, identities, true) };
+  };
+  if (choice?.type === "allowed_tools") {
+    if (!Array.isArray(choice.tools)) throw new ToolMappingError("allowed_tools requires a tools array");
+    if (choice.mode != null && choice.mode !== "auto" && choice.mode !== "required") throw new ToolMappingError("Unsupported allowed_tools mode");
+    if (!choice.tools.length && choice.mode === "required") throw new ToolMappingError("No allowed tools remain for a required tool choice");
+    return { ...choice, tools: choice.tools.map(reference) };
+  }
+  return reference(choice);
+}
+
+export type FlatTools = { tools: Json[]; customToolNames: Set<string>; namespaces: ToolIdentityMap; dropped: string[] };
 export function flattenTools(tools: Json, opts: { strictSchemas?: boolean } = {}): FlatTools {
-  const out: Json[] = []; const customToolNames = new Set<string>(); const namespaces = new Map<string, string>(); const dropped: string[] = [];
+  const out: Json[] = []; const customToolNames = new Set<string>(); const namespaces: ToolIdentityMap = new Map(); const dropped: string[] = [];
+  const definitions = new Map<string, Json>();
   const objectRoot = (schema: Json) => !schema || schema.type === "object" || (Array.isArray(schema.type) && schema.type.includes("object")) || (!!schema.properties && !schema.anyOf && !schema.oneOf);
-  const pushFn = (t: Json, ns?: string) => {
+  const pushTool = (t: Json, ns?: string) => {
     const params = t.parameters ?? { type: "object", properties: {} };
-    if (opts.strictSchemas && !objectRoot(params)) { dropped.push(`${ns ? ns + "." : ""}${t.name}(non-object schema)`); return; }
-    out.push({ type: "function", name: t.name, description: t.description ?? "", strict: false, parameters: params });
-    if (ns) namespaces.set(t.name, ns);
+    if (t.type === "function" && opts.strictSchemas && !objectRoot(params)) { dropped.push(`${ns ? ns + "." : ""}${t.name}(non-object schema)`); return; }
+    const name = upstreamToolName(t.name, ns);
+    const identity: ToolIdentity = { name: t.name, ...(ns === undefined ? {} : { namespace: ns }) };
+    if (namespaces.has(name)) {
+      if (!isDeepStrictEqual(namespaces.get(name), identity) || !isDeepStrictEqual(definitions.get(name), t)) {
+        throw new ToolMappingError(`Conflicting tool definitions: ${ns ? ns + "." : ""}${t.name}`);
+      }
+      return; // Only coalesce exact duplicates of the same logical tool.
+    }
+    namespaces.set(name, identity);
+    definitions.set(name, t);
+    if (t.type === "custom") {
+      customToolNames.add(name);
+      out.push({ ...customAsFunction(t), name });
+    } else out.push({ type: "function", name, description: t.description ?? "", strict: false, parameters: params });
   };
   for (const t of Array.isArray(tools) ? tools : []) {
     if (!t || typeof t !== "object") continue;
-    if (t.type === "function") pushFn(t);
-    else if (t.type === "namespace") { for (const inner of Array.isArray(t.tools) ? t.tools : []) if (inner?.type === "function") pushFn(inner, t.name); else if (inner?.type === "custom") { customToolNames.add(inner.name); namespaces.set(inner.name, t.name); out.push(customAsFunction(inner)); } }
-    else if (t.type === "custom") { customToolNames.add(t.name); out.push(customAsFunction(t)); }
+    if (t.type === "function" || t.type === "custom") pushTool(t);
+    else if (t.type === "namespace") {
+      if (typeof t.name !== "string" || !t.name) throw new ToolMappingError("Tool namespaces must have a nonempty name");
+      for (const inner of Array.isArray(t.tools) ? t.tools : []) {
+        if (inner?.type === "function" || inner?.type === "custom") pushTool(inner, t.name);
+      }
+    }
     else dropped.push(String(t.type));
   }
   return { tools: out, customToolNames, namespaces, dropped };
@@ -81,7 +144,8 @@ export function normalizeResponsesToolControls(req: Json): Json {
 // so historical calls to mapped custom tools must use the matching function-call item shapes too.
 export function sanitizeResponsesRequest(req: Json): SanitizedResponsesRequest {
   const flat = flattenTools(req?.tools, { strictSchemas: true });
-  const request: Json = normalizeResponsesToolControls({ ...req, tools: flat.tools });
+  const toolChoice = req.tool_choice && flattenedToolChoice(req.tool_choice, flat.namespaces);
+  const request: Json = normalizeResponsesToolControls({ ...req, tools: flat.tools, ...(toolChoice ? { tool_choice: toolChoice } : {}) });
 
   if (Array.isArray(request.input)) {
     request.input = request.input.flatMap((item: Json) => {
@@ -91,7 +155,7 @@ export function sanitizeResponsesRequest(req: Json): SanitizedResponsesRequest {
         return [{
           type: "function_call",
           call_id: item.call_id,
-          name: item.name,
+          name: inputToolName(item, flat.namespaces),
           arguments: JSON.stringify({ input: item.input ?? "" }),
         }];
       }
@@ -103,9 +167,9 @@ export function sanitizeResponsesRequest(req: Json): SanitizedResponsesRequest {
           output: item.output,
         }];
       }
-      if (item.type === "function_call" && "namespace" in item) {
+      if (item.type === "function_call") {
         const { namespace: _namespace, ...plainItem } = item;
-        return [plainItem];
+        return [{ ...plainItem, name: inputToolName(item, flat.namespaces) }];
       }
       return [item];
     });
@@ -114,9 +178,12 @@ export function sanitizeResponsesRequest(req: Json): SanitizedResponsesRequest {
   delete request.include;
   return { request, ...flat };
 }
-// Attach the originating namespace to a function/custom call item so Codex's tool router can dispatch it.
-export function withNamespace(item: Json, namespaces?: Map<string, string>): Json {
-  const ns = namespaces?.get(item?.name); return ns ? { ...item, namespace: ns } : item;
+// Restore the complete public tool identity before Codex dispatches a call.
+export function withNamespace(item: Json, namespaces?: ToolIdentityMap): Json {
+  const identity = namespaces?.get(item?.name);
+  if (!identity) return item;
+  const { namespace: _namespace, ...rest } = item;
+  return { ...rest, ...identity };
 }
 function customAsFunction(t: Json): Json {
   return { type: "function", name: t.name, strict: false, description: `${t.description ?? ""}\n\nCall this tool with a single string argument "input" containing the raw tool input exactly as it should be applied.`.trim(), parameters: { type: "object", properties: { input: { type: "string", description: "Raw tool input text" } }, required: ["input"] } };
@@ -130,12 +197,12 @@ function customItem(item: Json): Json {
   return { type: "custom_tool_call", id: item.id, call_id: item.call_id, name: item.name, input: customInputFromArgs(item.arguments ?? ""), status: item.status ?? "completed" };
 }
 // Rewrite a Responses API JSON body so function calls to mapped custom tools become custom_tool_call items.
-export function rewriteResponsesJson(res: Json, custom: Set<string>, namespaces?: Map<string, string>): Json {
+export function rewriteResponsesJson(res: Json, custom: Set<string>, namespaces?: ToolIdentityMap): Json {
   if (res && Array.isArray(res.output)) res.output = res.output.map((it: Json) => it?.type === "function_call" && custom.has(it.name) ? withNamespace(customItem(it), namespaces) : it?.type === "function_call" ? withNamespace(it, namespaces) : it);
   return res;
 }
 // Same for a streamed Responses SSE body.
-export function rewriteResponsesSse(upstream: Response, custom: Set<string>, namespaces?: Map<string, string>): ReadableStream<Uint8Array> {
+export function rewriteResponsesSse(upstream: Response, custom: Set<string>, namespaces?: ToolIdentityMap): ReadableStream<Uint8Array> {
   const enc = new TextEncoder(); const marked = new Set<string>();
   return new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -170,7 +237,7 @@ export function rewriteResponsesSse(upstream: Response, custom: Set<string>, nam
   });
 }
 
-export type TranslatedRequest = { chat: Json; customToolNames: Set<string>; namespaces: Map<string, string>; hasImages: boolean; initiator: "user" | "agent"; stream: boolean };
+export type TranslatedRequest = { chat: Json; customToolNames: Set<string>; namespaces: ToolIdentityMap; hasImages: boolean; initiator: "user" | "agent"; stream: boolean };
 
 export function responsesToChat(req: Json, supportedEfforts?: string[]): TranslatedRequest {
   const messages: Json[] = [];
@@ -181,7 +248,17 @@ export function responsesToChat(req: Json, supportedEfforts?: string[]): Transla
 
   // tools (namespaces flattened, custom -> function)
   const flat = flattenTools(req.tools);
-  const tools: Json[] = flat.tools.map((t) => ({ type: "function", function: { name: t.name, description: t.description ?? "", parameters: t.parameters ?? { type: "object", properties: {} } } }));
+  let tools: Json[] = flat.tools.map((t) => ({ type: "function", function: { name: t.name, description: t.description ?? "", parameters: t.parameters ?? { type: "object", properties: {} } } }));
+  let toolChoice: Json;
+  if (req.tool_choice) {
+    const tc = flattenedToolChoice(req.tool_choice, flat.namespaces);
+    if (tc.type === "allowed_tools") {
+      const allowed = new Set(tc.tools.map((tool: Json) => tool.name));
+      tools = tools.filter((tool) => allowed.has(tool.function.name));
+      toolChoice = tc.mode ?? "auto";
+      if (!tools.length && toolChoice === "required") throw new ToolMappingError("No allowed tools remain for a required tool choice");
+    } else toolChoice = typeof tc === "string" ? tc : { type: "function", function: { name: tc.name } };
+  }
   for (const n of flat.customToolNames) customToolNames.add(n);
 
   // input
@@ -201,9 +278,9 @@ export function responsesToChat(req: Json, supportedEfforts?: string[]): Transla
       if (role === "assistant") { flushAssistant(); messages.push({ role: "assistant", content: contentToText(it.content) }); continue; }
       flushAssistant(); messages.push({ role: "user", content });
     } else if (type === "function_call") {
-      pendingToolCalls.push({ id: it.call_id ?? it.id ?? uid("call"), type: "function", function: { name: it.name, arguments: typeof it.arguments === "string" ? it.arguments : JSON.stringify(it.arguments ?? {}) } });
+      pendingToolCalls.push({ id: it.call_id ?? it.id ?? uid("call"), type: "function", function: { name: inputToolName(it, flat.namespaces), arguments: typeof it.arguments === "string" ? it.arguments : JSON.stringify(it.arguments ?? {}) } });
     } else if (type === "custom_tool_call") {
-      pendingToolCalls.push({ id: it.call_id ?? it.id ?? uid("call"), type: "function", function: { name: it.name, arguments: JSON.stringify({ input: it.input ?? "" }) } });
+      pendingToolCalls.push({ id: it.call_id ?? it.id ?? uid("call"), type: "function", function: { name: inputToolName(it, flat.namespaces), arguments: JSON.stringify({ input: it.input ?? "" }) } });
     } else if (type === "function_call_output" || type === "custom_tool_call_output") {
       flushAssistant();
       messages.push({ role: "tool", tool_call_id: it.call_id, content: contentToText(it.output) || "(empty)" });
@@ -219,10 +296,7 @@ export function responsesToChat(req: Json, supportedEfforts?: string[]): Transla
 
   const chat: Json = { model: req.model, messages, stream: !!req.stream };
   if (tools.length) { chat.tools = tools; chat.parallel_tool_calls = req.parallel_tool_calls ?? true; }
-  if (tools.length && req.tool_choice) {
-    const tc = req.tool_choice;
-    chat.tool_choice = typeof tc === "string" ? tc : tc.type === "function" ? { type: "function", function: { name: tc.name } } : "auto";
-  }
+  if (tools.length && toolChoice) chat.tool_choice = toolChoice;
   if (req.stream) chat.stream_options = { include_usage: true };
   if (typeof req.max_output_tokens === "number") chat.max_tokens = req.max_output_tokens;
   if (typeof req.temperature === "number") chat.temperature = req.temperature;
@@ -242,6 +316,7 @@ export function responsesToChat(req: Json, supportedEfforts?: string[]): Transla
 
 // ---------- response translation ----------
 type ToolAcc = { id: string; callId: string; name: string; args: string; itemIndex: number; custom: boolean };
+type StreamToolAcc = ToolAcc & { added: boolean; sentArgs: number };
 function usageToResponses(u: Json) {
   if (!u) return undefined;
   return {
@@ -258,7 +333,7 @@ function toolItem(t: ToolAcc): Json {
   return { type: "function_call", id: t.id, call_id: t.callId, name: t.name, arguments: t.args, status: "completed" };
 }
 
-export async function chatToResponsesNonStream(chatRes: Json, req: Json, customToolNames: Set<string>, namespaces?: Map<string, string>): Promise<Json> {
+export async function chatToResponsesNonStream(chatRes: Json, req: Json, customToolNames: Set<string>, namespaces?: ToolIdentityMap): Promise<Json> {
   const choice = chatRes.choices?.[0] ?? {};
   const msg = choice.message ?? {};
   const output: Json[] = [];
@@ -270,7 +345,7 @@ export async function chatToResponsesNonStream(chatRes: Json, req: Json, customT
 }
 
 // Streams a chat-completions SSE body and writes Responses-API SSE events to the returned ReadableStream.
-export function chatStreamToResponsesStream(upstream: Response, req: Json, customToolNames: Set<string>, onDone?: (info: { status: string; error?: string }) => void, namespaces?: Map<string, string>): ReadableStream<Uint8Array> {
+export function chatStreamToResponsesStream(upstream: Response, req: Json, customToolNames: Set<string>, onDone?: (info: { status: string; error?: string }) => void, namespaces?: ToolIdentityMap): ReadableStream<Uint8Array> {
   const enc = new TextEncoder();
   const responseId = uid("resp");
   let seq = 0;
@@ -285,12 +360,43 @@ export function chatStreamToResponsesStream(upstream: Response, req: Json, custo
       let outputIndex = 0;
       let msg: { id: string; index: number; text: string } | undefined;
       let reasoning: { id: string; index: number; text: string } | undefined;
-      const tools = new Map<number, ToolAcc>();
+      const tools = new Map<number, StreamToolAcc>();
       let usage: Json; let finish: string | undefined; let errorText: string | undefined;
 
       const closeMessage = () => { if (!msg) return; emit("response.output_text.done", { item_id: msg.id, output_index: msg.index, content_index: 0, text: msg.text }); const item = { type: "message", id: msg.id, role: "assistant", status: "completed", content: [{ type: "output_text", text: msg.text, annotations: [] }] }; emit("response.content_part.done", { item_id: msg.id, output_index: msg.index, content_index: 0, part: item.content[0] }); emit("response.output_item.done", { output_index: msg.index, item }); output[msg.index] = item; msg = undefined; };
       const closeReasoning = () => { if (!reasoning) return; emit("response.reasoning_summary_text.done", { item_id: reasoning.id, output_index: reasoning.index, summary_index: 0, text: reasoning.text }); const item = { type: "reasoning", id: reasoning.id, summary: [{ type: "summary_text", text: reasoning.text }] }; emit("response.reasoning_summary_part.done", { item_id: reasoning.id, output_index: reasoning.index, summary_index: 0, part: item.summary[0] }); emit("response.output_item.done", { output_index: reasoning.index, item }); output[reasoning.index] = item; reasoning = undefined; };
-      const closeTools = () => { for (const t of tools.values()) { const item = withNamespace(toolItem(t), namespaces); if (!t.custom) emit("response.function_call_arguments.done", { item_id: t.id, output_index: t.itemIndex, arguments: t.args }); emit("response.output_item.done", { output_index: t.itemIndex, item }); output[t.itemIndex] = item; } tools.clear(); };
+      const openTool = (t: StreamToolAcc, final = false) => {
+        if (t.added) return;
+        // Chat deltas can send arguments before the name, or fragment the name.
+        // Never expose a partial alias (or guess its namespace/type) to Codex.
+        const known = namespaces?.has(t.name);
+        const ambiguousPrefix = namespaces && [...namespaces.keys()].some((name) => name !== t.name && name.startsWith(t.name));
+        if (!final && (!known || !t.callId || ambiguousPrefix)) return;
+        if (!t.name || (namespaces && !known)) throw new Error("Upstream returned an unknown or incomplete tool name");
+        t.custom = customToolNames.has(t.name);
+        t.id = uid(t.custom ? "ctc" : "fc");
+        t.callId ||= uid("call");
+        t.added = true;
+        emit("response.output_item.added", { output_index: t.itemIndex, item: withNamespace({
+          type: t.custom ? "custom_tool_call" : "function_call", id: t.id, call_id: t.callId, name: t.name,
+          ...(t.custom ? { input: "" } : { arguments: "" }), status: "in_progress",
+        }, namespaces) });
+      };
+      const flushToolArgs = (t: StreamToolAcc) => {
+        if (!t.added || t.custom || t.sentArgs === t.args.length) return;
+        emit("response.function_call_arguments.delta", { item_id: t.id, output_index: t.itemIndex, delta: t.args.slice(t.sentArgs) });
+        t.sentArgs = t.args.length;
+      };
+      const closeTools = () => {
+        for (const t of tools.values()) {
+          openTool(t, true); flushToolArgs(t);
+          const item = withNamespace(toolItem(t), namespaces);
+          if (t.custom) emit("response.custom_tool_call_input.done", { item_id: t.id, output_index: t.itemIndex, input: item.input });
+          else emit("response.function_call_arguments.done", { item_id: t.id, output_index: t.itemIndex, arguments: t.args });
+          emit("response.output_item.done", { output_index: t.itemIndex, item }); output[t.itemIndex] = item;
+        }
+        tools.clear();
+      };
 
       try {
         const reader = upstream.body!.getReader(); const dec = new TextDecoder(); let buf = "";
@@ -323,18 +429,27 @@ export function chatStreamToResponsesStream(upstream: Response, req: Json, custo
               const idx = tc.index ?? 0;
               let t = tools.get(idx);
               if (!t) {
-                const name = tc.function?.name ?? ""; const custom = customToolNames.has(name);
-                t = { id: uid(custom ? "ctc" : "fc"), callId: tc.id ?? uid("call"), name, args: "", itemIndex: outputIndex++, custom };
+                t = { id: "", callId: "", name: "", args: "", itemIndex: outputIndex++, custom: false, added: false, sentArgs: 0 };
                 tools.set(idx, t);
-                emit("response.output_item.added", { output_index: t.itemIndex, item: withNamespace(custom ? { type: "custom_tool_call", id: t.id, call_id: t.callId, name, input: "", status: "in_progress" } : { type: "function_call", id: t.id, call_id: t.callId, name, arguments: "", status: "in_progress" }, namespaces) });
-              } else if (tc.function?.name && !t.name) t.name = tc.function.name;
-              const a = tc.function?.arguments; if (typeof a === "string" && a) { t.args += a; if (!t.custom) emit("response.function_call_arguments.delta", { item_id: t.id, output_index: t.itemIndex, delta: a }); }
+              }
+              if (tc.id) {
+                if (t.callId && t.callId !== tc.id) throw new Error("Upstream changed a tool call ID mid-stream");
+                t.callId = tc.id;
+              }
+              const name = tc.function?.name;
+              if (typeof name === "string" && name) {
+                if (t.added) { if (name !== t.name) throw new Error("Upstream changed a tool name after it was emitted"); }
+                else t.name += name;
+              }
+              const a = tc.function?.arguments; if (typeof a === "string") t.args += a;
+              openTool(t); flushToolArgs(t);
             }
             if (choice.finish_reason) finish = choice.finish_reason;
           }
         }
       } catch (e) { errorText = String(e); }
-      closeReasoning(); closeMessage(); closeTools();
+      closeReasoning(); closeMessage();
+      try { closeTools(); } catch (e) { errorText ??= String(e); }
       const final = output.filter(Boolean);
       if (errorText) {
         emit("error", { code: "upstream_error", message: errorText });

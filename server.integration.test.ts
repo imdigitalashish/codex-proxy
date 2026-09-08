@@ -16,6 +16,7 @@ const apiModel = (id: string, vendor = "OpenAI", endpoint = "/responses") => ({
 const rawCatalog = { data: [
   apiModel("gpt-5.4-mini"), apiModel("gpt-5.6-sol"), apiModel("gpt-6-astra"), apiModel("gpt-5.6-sol-fast"),
   apiModel("claude-opus-5", "Anthropic", "/chat/completions"),
+  apiModel("grok-fixture", "xAI"),
 ] };
 let home: string;
 let baseUrl: string;
@@ -25,6 +26,89 @@ let stdout: Promise<string>;
 let stderr: Promise<string>;
 let logText = "";
 let captured: { path: string; body: any }[] = [];
+
+const fixtureSse = (events: any[], chat = false) => new Response(events.map((event) =>
+  `${chat ? "" : `event: ${event.type}\n`}data: ${JSON.stringify(event)}\n\n`).join("") + (chat ? "data: [DONE]\n\n" : ""), {
+  headers: { "content-type": "text/event-stream" },
+});
+const readFixtureResponse = async (response: Response, stream: boolean) => {
+  expect(response.status).toBe(200);
+  if (!stream) return response.json();
+  const events = (await response.text()).split("\n").filter((line) => line.startsWith("data: ")).map((line) => JSON.parse(line.slice(6)));
+  expect(events.at(-1).type).toBe("response.completed");
+  const completed = events.at(-1).response;
+  const added = events.filter((event) => event.type === "response.output_item.added" && event.item.type !== "message");
+  for (const { item } of added) {
+    const final = completed.output.find((call: any) => call.call_id === item.call_id);
+    expect({ name: item.name, namespace: item.namespace, type: item.type })
+      .toEqual({ name: final.name, namespace: final.namespace, type: final.type });
+  }
+  return completed;
+};
+
+// A strict, deterministic upstream that rejects the original duplicate-name bug
+// and validates a complete function/custom tool-result round trip.
+function fixtureToolResponse(path: string, body: any): Response {
+  const chat = path === "/v1/chat/completions";
+  const tools = (body.tools ?? []).map((tool: any) => chat ? tool.function : tool);
+  const names = tools.map((tool: any) => tool?.name);
+  const reject = (message: string) => Response.json({ error: { message, code: "invalid_request_body" } }, { status: 400 });
+  if (new Set(names).size !== names.length) return reject("tools: Tool names must be unique.");
+  if (names.some((name: any) => typeof name !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(name))) return reject("invalid tool name");
+  const input = Array.isArray(body.input) ? body.input : [];
+  const history = chat ? (body.messages ?? []).flatMap((item: any) => item.tool_calls ?? [])
+    : input.filter((item: any) => item.type === "function_call");
+  const results = chat ? (body.messages ?? []).filter((item: any) => item.role === "tool")
+    : input.filter((item: any) => item.type === "function_call_output");
+  if (results.length) {
+    if (history.length !== results.length) return reject("missing call history");
+    for (const call of history) {
+      const id = chat ? call.id : call.call_id;
+      const name = chat ? call.function.name : call.name;
+      const result = results.find((item: any) => (chat ? item.tool_call_id : item.call_id) === id);
+      if (!names.includes(name) || call.namespace !== undefined || !result
+        || (chat ? result.content : result.output) !== `fixture-result:${id}`) return reject("incorrect tool-result mapping");
+    }
+  }
+  const choice = body.tool_choice;
+  const forcedName = chat ? choice?.function?.name : choice?.type === "function" ? choice.name : undefined;
+  if (forcedName && !names.includes(forcedName)) return reject("unknown forced tool");
+  let selected = forcedName ? tools.filter((tool: any) => tool.name === forcedName) : tools;
+  if (choice?.type === "allowed_tools") {
+    const allowed = choice.tools.map((tool: any) => tool.name);
+    if (allowed.some((name: string) => !names.includes(name))) return reject("unknown allowed tool");
+    selected = tools.filter((tool: any) => allowed.includes(tool.name));
+  }
+  const calls = results.length ? [] : selected.map((tool: any, i: number) => ({
+    type: "function_call", id: `fc_fixture_${i}`, call_id: `call_fixture_${i}`, name: tool.name, status: "completed",
+    arguments: JSON.stringify(tool.parameters?.properties?.input ? { input: "synthetic raw input" } : { query: "synthetic" }),
+  }));
+  if (chat) {
+    if (!body.stream) return Response.json({ model: body.model, choices: [{ message: {
+      role: "assistant", content: results.length ? "TOOL_ROUNDTRIP_OK" : null,
+      tool_calls: calls.map((call: any) => ({ id: call.call_id, type: "function", function: { name: call.name, arguments: call.arguments } })),
+    }, finish_reason: calls.length ? "tool_calls" : "stop" }] });
+    const delta = (tool_calls: any[]) => ({ choices: [{ delta: { tool_calls } }] });
+    return fixtureSse([
+      delta(calls.map((call: any, index: number) => ({ index, id: call.call_id, function: { arguments: call.arguments.slice(0, 4) } }))),
+      ...[...calls.keys()].reverse().map((index) => delta([{ index, function: { name: calls[index].name.slice(0, 3) } }])),
+      ...calls.map((call: any, index: number) => delta([{ index, function: { name: call.name.slice(3), arguments: call.arguments.slice(4) } }])),
+      { choices: [{ delta: results.length ? { content: "TOOL_ROUNDTRIP_OK" } : {}, finish_reason: calls.length ? "tool_calls" : "stop" }] },
+    ], true);
+  }
+  const response = { id: "resp_tool_fixture", model: body.model, status: "completed", output: results.length
+    ? [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "TOOL_ROUNDTRIP_OK" }] }] : calls };
+  if (!body.stream) return Response.json(response);
+  return fixtureSse([
+    ...calls.map((item: any, output_index: number) => ({ type: "response.output_item.added", output_index, item: { ...item, arguments: "", status: "in_progress" } })),
+    ...calls.flatMap((item: any, output_index: number) => [
+      { type: "response.function_call_arguments.delta", item_id: item.id, output_index, delta: item.arguments },
+      { type: "response.function_call_arguments.done", item_id: item.id, output_index, arguments: item.arguments },
+      { type: "response.output_item.done", output_index, item },
+    ]),
+    { type: "response.completed", response },
+  ]);
+}
 
 beforeAll(async () => {
   home = await mkdtemp(join(tmpdir(), "codex-proxy-integration-"));
@@ -53,6 +137,7 @@ beforeAll(async () => {
         status: forcedStatus, headers: { "content-type": "application/json", "x-request-id": "fixture-upstream-id" },
       });
       if (!body) return Response.json({ error: "invalid JSON" }, { status: 400 });
+      if (request.headers.get("x-test-tool-roundtrip") === "1") return fixtureToolResponse(path, body);
       if (body.reasoning?.effort === "ultra") {
         return Response.json({ error: { message: "Invalid value: 'ultra'. Supported values include 'max'.", code: "invalid_request_body" } }, { status: 400 });
       }
@@ -172,6 +257,92 @@ describe("proxy HTTP integration", () => {
     expect(captured[0].body).not.toHaveProperty("tool_choice");
   });
 
+  const search = { type: "function", name: "search", parameters: { type: "object", properties: { query: { type: "string" } } } };
+  const duplicateShortNames = () => [
+    search,
+    { type: "namespace", name: "crm", tools: [search] },
+    { type: "namespace", name: "support", tools: [search] },
+    { type: "namespace", name: "editor", tools: [{ type: "custom", name: "search" }] },
+  ];
+  const toolHeaders = { "user-agent": "codex-test", "x-test-tool-roundtrip": "1" };
+
+  test.each([
+    ["claude-opus-5", false], ["claude-opus-5", true], ["grok-fixture", false], ["grok-fixture", true],
+  ])("%s supports duplicate short names and tool-result continuation (stream=%s)", async (model, stream) => {
+    const tools = duplicateShortNames();
+    const input = [{ role: "user", content: "Call the synthetic tools" }];
+    const first = await readFixtureResponse(await post({ model, stream, input, tools }, toolHeaders), stream);
+    expect(first.output).toMatchObject([
+      { type: "function_call", name: "search", call_id: "call_fixture_0" },
+      { type: "function_call", name: "search", namespace: "crm", call_id: "call_fixture_1" },
+      { type: "function_call", name: "search", namespace: "support", call_id: "call_fixture_2" },
+      { type: "custom_tool_call", name: "search", namespace: "editor", call_id: "call_fixture_3", input: "synthetic raw input" },
+    ]);
+    expect(first.output[0]).not.toHaveProperty("namespace");
+    expect(first.output[3]).not.toHaveProperty("arguments");
+    const wireTools = captured[0].body.tools.map((tool: any) => tool.function?.name ?? tool.name);
+    expect(new Set(wireTools).size).toBe(4);
+    const results = first.output.map((call: any) => ({
+      type: call.type === "custom_tool_call" ? "custom_tool_call_output" : "function_call_output",
+      call_id: call.call_id, output: `fixture-result:${call.call_id}`,
+    }));
+    const second = await readFixtureResponse(await post({ model, stream, tools: [...tools].reverse(),
+      input: [...input, ...first.output, ...results], tool_choice: "auto",
+    }, toolHeaders), stream);
+    expect(JSON.stringify(second.output)).toContain("TOOL_ROUNDTRIP_OK");
+    expect(captured).toHaveLength(2);
+    expect(captured[1].body.tools.map((tool: any) => tool.function?.name ?? tool.name)).toEqual([...wireTools].reverse());
+    const history = model === "claude-opus-5" ? captured[1].body.messages.flatMap((message: any) => message.tool_calls ?? [])
+      : captured[1].body.input.filter((item: any) => item.type === "function_call");
+    expect(history.map((call: any) => call.function?.name ?? call.name)).toEqual(wireTools);
+    expect(history.map((call: any) => call.id && model === "claude-opus-5" ? call.id : call.call_id))
+      .toEqual(first.output.map((call: any) => call.call_id));
+  });
+
+  test.each(["claude-opus-5", "grok-fixture"])("%s maps forced custom and allowed-tool choices", async (model) => {
+    const tools = duplicateShortNames();
+    const forced = await readFixtureResponse(await post({ model, input: "go", tools,
+      tool_choice: { type: "custom", name: "search", namespace: "editor" },
+    }, toolHeaders), false);
+    expect(forced.output).toHaveLength(1);
+    expect(forced.output[0]).toMatchObject({ type: "custom_tool_call", name: "search", namespace: "editor" });
+    const allowed = await readFixtureResponse(await post({ model, input: "go", tools,
+      tool_choice: { type: "allowed_tools", mode: "required", tools: [
+        { type: "function", name: "search", namespace: "support" }, { type: "custom", name: "search", namespace: "editor" },
+      ] },
+    }, toolHeaders), false);
+    expect(allowed.output).toMatchObject([
+      { type: "function_call", name: "search", namespace: "support" },
+      { type: "custom_tool_call", name: "search", namespace: "editor" },
+    ]);
+  });
+
+  test.each(["claude-opus-5", "grok-fixture"])("%s rejects conflicting definitions before sending a generation request", async (model) => {
+    const response = await post({ model, input: "go", tools: [search, { ...search, description: "conflicting" }] }, toolHeaders);
+    expect(response.status).toBe(400);
+    expect((await response.json()).error).toMatchObject({ type: "invalid_request_error", code: "invalid_tool_definition" });
+    expect(captured).toEqual([]);
+  });
+
+  test.each(["claude-opus-5", "grok-fixture"])("%s safely coalesces identical declarations", async (model) => {
+    const response = await readFixtureResponse(await post({ model, input: "go", tools: [search, structuredClone(search)] }, toolHeaders), false);
+    expect(captured[0].body.tools).toHaveLength(1);
+    expect(response.output).toHaveLength(1);
+    expect(response.output[0].name).toBe("search");
+  });
+
+  test("leaves native OpenAI namespaces, tool choices, and namespaced history unchanged", async () => {
+    const body = { model: "gpt-6-astra", tools: duplicateShortNames(), stream: false,
+      tool_choice: { type: "custom", name: "search", namespace: "editor" }, input: [
+        { type: "function_call", call_id: "previous", name: "search", namespace: "support", arguments: "{}" },
+        { type: "function_call_output", call_id: "previous", output: "ok" },
+      ] };
+    const response = await post(body);
+    expect(response.status).toBe(200);
+    await response.text();
+    expect(captured).toEqual([{ path: "/v1/responses", body }]);
+  });
+
   test("blocks oversized Codex uploads locally without altering or retrying the payload", async () => {
     const body = { model: "gpt-6-astra", input: "x".repeat(maxBodyBytes), stream: true };
     const response = await post(body, { "user-agent": "codex-test" });
@@ -244,8 +415,9 @@ describe("proxy HTTP integration", () => {
     const log = logText.split("\n").filter(Boolean).map((line) => JSON.parse(line)).find((entry) => entry.upstreamRequestId === "fixture-upstream-id");
     expect(log).toMatchObject({
       event: "request_body_too_large", source: "upstream", status: 413, clientStatus: 200,
-      bodyBytes: Buffer.byteLength(JSON.stringify(body)), requestKind: "turn", error: upstreamSizeError,
+      bodyBytes: Buffer.byteLength(JSON.stringify(body)), requestKind: "turn", error_redacted: true,
     });
+    expect(log).not.toHaveProperty("error");
   });
 
   test("also normalizes upstream size failures from the chat bridge for Codex SSE clients", async () => {

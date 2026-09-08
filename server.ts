@@ -3,11 +3,16 @@
 // - Streams SSE untouched for Responses-native models; translates Responses <-> Chat Completions for models the
 //   upstream only serves on /chat/completions (Claude, Gemini, ...) so Codex tools/subagents work on them too.
 // - Answers Codex clients' GET /v1/models in Codex's own schema: template models + generated entries for extra models.
-import { responsesToChat, chatToResponsesNonStream, chatStreamToResponsesStream, normalizeResponsesToolControls, sanitizeResponsesRequest, rewriteResponsesJson, rewriteResponsesSse, trimReasoningItems } from "./responses-bridge.ts";
+import { responsesToChat, chatToResponsesNonStream, chatStreamToResponsesStream, normalizeResponsesToolControls, sanitizeResponsesRequest, rewriteResponsesJson, rewriteResponsesSse, trimReasoningItems, ToolMappingError, type ToolIdentityMap } from "./responses-bridge.ts";
 import { UploadGate, bodyBytes, drainSignalStream } from "./upload-gate.ts";
 import { buildCodexModels, isUsablePickerModel, supportsResponses, type CatalogEntry } from "./model-catalog.ts";
 import { COPILOT_MAX_BODY_BYTES, parseBodyLimit, assertBodyFits, RequestBodyTooLarge, bodyLimitResponse, codexRequestKind, readErrorPreview } from "./request-body-limit.ts";
 import { homedir } from "node:os";
+import { writePrivateAuthFile } from "./copilot-auth.ts";
+import { readOmpCopilotCredential } from "./copilot-credentials.ts";
+import { watchTaskParent } from "./windows.ts";
+
+watchTaskParent();
 
 const HOME = Bun.env.HOME || homedir();
 const mode = (Bun.env.UPSTREAM_MODE ?? (Bun.env.UPSTREAM_API_KEY ? "relay" : "copilot")).toLowerCase();
@@ -16,6 +21,7 @@ const relayKey = Bun.env.UPSTREAM_API_KEY ?? "";
 const port = Number(Bun.env.PORT ?? 4141);
 const codexModelsTemplatePath = Bun.env.CODEX_MODELS_TEMPLATE ?? `${HOME}/.codex-proxy/models-template.json`;
 const githubTokenFile = Bun.env.COPILOT_GITHUB_TOKEN_FILE ?? `${HOME}/.codex-proxy/github-token`;
+const ompAuthDb = Bun.env.COPILOT_OMP_AUTH_DB;
 const accountType = (Bun.env.COPILOT_ACCOUNT_TYPE ?? "individual").toLowerCase();
 const aliases: Record<string, string> = (() => { try { return JSON.parse(Bun.env.MODEL_ALIASES ?? "{}"); } catch { return {}; } })();
 const extraPickerModels = (Bun.env.EXTRA_PICKER_MODELS ?? "claude-opus-5,claude-sonnet-5,claude-opus-4.8,claude-opus-4.7,claude-sonnet-4.6,claude-haiku-4.5,gemini-3.7-flash,gemini-3.6-flash,grok-4.6,grok-4.5,gpt-5.3-codex,gpt-5.6-sol-fast").split(",").map((s) => s.trim()).filter(Boolean);
@@ -27,7 +33,8 @@ const uploadGate = new UploadGate(Math.max(0, Number(Bun.env.UPLOAD_CONCURRENCY 
 const uploadStreaming = (Bun.env.UPLOAD_GATE_STREAM ?? "1") !== "0";
 const upstreamRetries = Math.max(0, Number(Bun.env.UPSTREAM_RETRIES ?? 2) || 0);
 const trimReasoningKB = Math.max(0, Number(Bun.env.TRIM_REASONING_KB ?? 0) || 0);
-const trimReasoningOn408 = (Bun.env.TRIM_REASONING_ON_408 ?? "1") !== "0";
+const trimReasoningOn408 = Bun.env.TRIM_REASONING_ON_408 === "1";
+const recordErrorBodies = Bun.env.RECORD_ERROR_BODIES === "1";
 const trimReasoningKeep = Math.max(0, Number(Bun.env.TRIM_REASONING_KEEP ?? 4) || 0);
 const retryableStatus = new Set([408, 502, 503, 504]);
 const upstreamMaxBodyBytes = parseBodyLimit(Bun.env.UPSTREAM_MAX_BODY_BYTES, mode === "copilot" ? COPILOT_MAX_BODY_BYTES : 0);
@@ -35,10 +42,19 @@ const bodyBudgetPaths = new Set(["/responses", "/responses/compact", "/chat/comp
 
 if (mode === "relay" && (!relayBase || !relayKey)) { console.error("relay mode needs UPSTREAM_BASE_URL and UPSTREAM_API_KEY"); process.exit(1); }
 if (mode !== "relay" && mode !== "copilot") { console.error(`unknown UPSTREAM_MODE ${mode}`); process.exit(1); }
+if (mode === "copilot" && ompAuthDb && Bun.env.COPILOT_GITHUB_TOKEN_FILE) {
+  console.error("Choose COPILOT_OMP_AUTH_DB or COPILOT_GITHUB_TOKEN_FILE, not both"); process.exit(1);
+}
 
 const dropRequestHeaders = new Set(["host", "authorization", "content-length", "connection", "accept-encoding", "x-api-key", "cookie"]);
 const dropResponseHeaders = new Set(["content-encoding", "content-length", "transfer-encoding", "connection", "keep-alive"]);
-function log(fields: Record<string, unknown>) { console.log(JSON.stringify({ at: new Date().toISOString(), ...fields })); }
+function log(fields: Record<string, unknown>) {
+  // Upstream error text can echo input. Keep status/size/correlation metadata by default.
+  const { error, ...metadata } = fields;
+  console.log(JSON.stringify({ at: new Date().toISOString(), ...metadata,
+    ...(error === undefined ? {} : recordErrorBodies ? { error } : { error_redacted: true }),
+  }));
+}
 const isCodexClient = (r: Request) => /codex/i.test(r.headers.get("user-agent") ?? "") || r.headers.has("originator");
 
 // ---------- GitHub Copilot auth ----------
@@ -49,8 +65,9 @@ const ghBaseHeaders = () => ({
   "editor-version": `vscode/${VSCODE_VERSION}`, "editor-plugin-version": `copilot-chat/${COPILOT_VERSION}`,
   "user-agent": `GitHubCopilotChat/${COPILOT_VERSION}`, "x-github-api-version": "2025-04-01", "x-vscode-user-agent-library-version": "electron-fetch",
 });
-type CopilotToken = { token: string; expiresAt: number; apiBase: string };
+type CopilotToken = { token: string; expiresAt?: number; apiBase: string };
 let copilotToken: CopilotToken | undefined; let copilotTokenPromise: Promise<CopilotToken> | undefined;
+let directVerifiedAt = 0;
 async function githubToken(): Promise<string> {
   const f = Bun.file(githubTokenFile);
   if (!(await f.exists())) throw new Error(`not logged in: run  bun ~/.codex-proxy/copilot-auth.ts`);
@@ -63,11 +80,31 @@ async function fetchCopilotToken(): Promise<CopilotToken> {
   const body = (await r.json()) as { token: string; expires_at: number; endpoints?: { api?: string } };
   const defaultBase = accountType === "individual" ? "https://api.githubcopilot.com" : `https://api.${accountType}.githubcopilot.com`;
   copilotToken = { token: body.token, expiresAt: body.expires_at * 1000, apiBase: (body.endpoints?.api ?? defaultBase).replace(/\/+$/, "") };
-  log({ event: "copilot_token_refreshed", expiresInMin: Math.round((copilotToken.expiresAt - Date.now()) / 60000), apiBase: copilotToken.apiBase });
+  log({ event: "copilot_token_refreshed", expiresInMin: Math.round((copilotToken.expiresAt! - Date.now()) / 60000), apiBase: copilotToken.apiBase });
   return copilotToken;
 }
 async function getCopilotToken(force = false): Promise<CopilotToken> {
-  if (!force && copilotToken && copilotToken.expiresAt - Date.now() > 120_000) return copilotToken;
+  if (ompAuthDb) {
+    const credential = readOmpCopilotCredential(ompAuthDb);
+    if (!force && copilotToken?.token === credential.token && copilotToken.apiBase === credential.apiBase
+      && Date.now() - directVerifiedAt < 60_000) return copilotToken;
+    if (!copilotTokenPromise) copilotTokenPromise = (async () => {
+      // Direct OAuth is validated against Copilot, not merely the presence of a local token.
+      const response = await fetch(`${credential.apiBase}/models`, {
+        headers: { ...ghBaseHeaders(), authorization: `Bearer ${credential.token}` },
+        redirect: "error", signal: AbortSignal.timeout(15_000),
+      });
+      if (!response.ok) throw new Error(`Copilot direct authentication failed: HTTP ${response.status}; reauthenticate in OMP`);
+      const models = await response.json() as { data?: unknown };
+      if (!Array.isArray(models.data)) throw new Error("Copilot direct authentication returned an invalid model catalog");
+      copilotToken = credential;
+      directVerifiedAt = Date.now();
+      log({ event: "copilot_direct_authenticated", source: "omp", apiBase: credential.apiBase });
+      return credential;
+    })().finally(() => { copilotTokenPromise = undefined; });
+    return copilotTokenPromise;
+  }
+  if (!force && copilotToken?.expiresAt && copilotToken.expiresAt - Date.now() > 120_000) return copilotToken;
   if (!copilotTokenPromise) copilotTokenPromise = fetchCopilotToken().finally(() => { copilotTokenPromise = undefined; });
   return copilotTokenPromise;
 }
@@ -112,7 +149,7 @@ async function forward(request: Request): Promise<Response> {
   const ua = (request.headers.get("user-agent") ?? "").slice(0, 60);
   if (url.pathname === "/healthz") {
     let copilot: unknown;
-    if (mode === "copilot") { try { const t = await getCopilotToken(); copilot = { authenticated: true, apiBase: t.apiBase, tokenExpiresInMin: Math.round((t.expiresAt - Date.now()) / 60000) }; } catch (e) { copilot = { authenticated: false, error: String(e).slice(0, 200) }; } }
+    if (mode === "copilot") { try { const t = await getCopilotToken(); copilot = { authenticated: true, source: ompAuthDb ? "omp" : "device-flow", apiBase: t.apiBase, ...(t.expiresAt === undefined ? {} : { tokenExpiresInMin: Math.round((t.expiresAt - Date.now()) / 60000) }) }; } catch (e) { copilot = { authenticated: false, error: String(e).slice(0, 200) }; } }
     const cat = await getCatalog();
     const usablePickerModels = cat ? [...cat.values()].filter(isUsablePickerModel) : [];
     return Response.json({ ok: true, mode, port, upstream: mode === "relay" ? new URL(relayBase).host : "api.githubcopilot.com", aliases, copilot, requestLimits: { upstreamMaxBodyBytes }, uplink: { uploads: uploadGate.stats, streaming: uploadStreaming, upstreamRetries, trimReasoningKB, trimReasoningOn408, trimReasoningKeep }, catalogModels: cat?.size ?? 0, usablePickerModels: usablePickerModels.map((m) => m.id), extraPickerModels: extraPickerModels.filter((id) => cat?.has(id)), bridged: usablePickerModels.filter((m) => !supportsResponses(m)).map((m) => m.id) });
@@ -147,7 +184,7 @@ async function forward(request: Request): Promise<Response> {
   let trimmedFromKB: number | undefined; let retries = 0; let queuedMs = 0; let translatedToChat = false;
   const extraLog = () => ({ ...(queuedMs ? { queuedMs } : {}), ...(retries ? { retries } : {}), ...(trimmedFromKB !== undefined ? { trimmedFromKB } : {}) });
   // Oversized /responses bodies: drop older encrypted reasoning items (the model loses its earlier chain of thought,
-  // nothing else changes). Pre-emptively above TRIM_REASONING_KB, and always after an upstream 408 (upload too slow).
+  // nothing else changes). Both pre-emptive and post-408 trimming require explicit opt-in.
   const applyTrim = (reason: string): boolean => {
     if (path !== "/responses" || !parsed || trimmedFromKB !== undefined) return false;
     const dropped = trimReasoningItems(parsed, trimReasoningKeep);
@@ -232,7 +269,7 @@ async function forward(request: Request): Promise<Response> {
     }
     // Responses-native models from non-OpenAI vendors (Grok, mai-code) reject Codex's namespace/custom/web_search
     // tool types with a bare 422. Send them plain function tools and map custom-tool calls back in the stream.
-    let sanitized: Set<string> | undefined; let sanitizedNamespaces: Map<string, string> | undefined;
+    let sanitized: Set<string> | undefined; let sanitizedNamespaces: ToolIdentityMap | undefined;
     const sanitize = () => {
       const result = sanitizeResponsesRequest(parsed);
       sanitized = result.customToolNames; sanitizedNamespaces = result.namespaces;
@@ -256,17 +293,27 @@ async function forward(request: Request): Promise<Response> {
     const responseHeaders = new Headers();
     for (const [n, v] of upstream.headers) if (!dropResponseHeaders.has(n.toLowerCase())) responseHeaders.set(n, v);
     if (upstream.status >= 400) {
-      // Capture the upstream error and the request that caused it for diagnosis (bodies stay local).
+      // Full requests can contain credentials, tool output, and images. Capture only by explicit opt-in.
       const text = await upstream.text();
-      const file = `${HOME}/.codex-proxy/errors/${Date.now()}-${upstream.status}-${(model ?? "nomodel").replace(/[^a-z0-9.-]/gi, "_")}.json`;
-      try { await Bun.write(file, JSON.stringify({ at: new Date().toISOString(), status: upstream.status, model, path, ua, error: text.slice(0, 4000), request: parsed ?? null }, null, 2)); } catch {}
-      log({ method: request.method, path: url.pathname + url.search, model, reqKB, ...extraLog(), stream, status: upstream.status, ms: Date.now() - started, ua, error: text.slice(0, 300), saved: file });
+      let saved: string | undefined;
+      if (recordErrorBodies) {
+        const file = `${HOME}/.codex-proxy/errors/${Date.now()}-${crypto.randomUUID()}.json`;
+        try {
+          await writePrivateAuthFile(file, JSON.stringify({ at: new Date().toISOString(), status: upstream.status, model, path, ua, error: text.slice(0, 4000), request: parsed ?? null }, null, 2));
+          saved = file;
+        } catch { log({ event: "error_record_failed", status: upstream.status }); }
+      }
+      log({ method: request.method, path: url.pathname + url.search, model, reqKB, ...extraLog(), stream, status: upstream.status, ms: Date.now() - started, ua, ...(recordErrorBodies ? { error: text.slice(0, 300) } : {}), saved });
       responseHeaders.set("content-type", upstream.headers.get("content-type") ?? "application/json");
       return new Response(text, { status: upstream.status, headers: responseHeaders });
     }
     log({ method: request.method, path: url.pathname + url.search, model, effort, reqKB, ...extraLog(), stream, initiator: mode === "copilot" ? initiator : undefined, status: upstream.status, ms: Date.now() - started, ua });
     return new Response(upstream.body, { status: upstream.status, headers: responseHeaders });
   } catch (error) {
+    if (error instanceof ToolMappingError) {
+      log({ event: "invalid_tool_mapping", method: request.method, path: url.pathname, model, status: 400 });
+      return Response.json({ error: { message: error.message, type: "invalid_request_error", code: "invalid_tool_definition" } }, { status: 400 });
+    }
     if (error instanceof RequestBodyTooLarge) {
       const headers = new Headers();
       if (error.upstream) for (const [n, v] of error.upstream.headers) if (!dropResponseHeaders.has(n.toLowerCase())) headers.set(n, v);
