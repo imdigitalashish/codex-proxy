@@ -38,6 +38,11 @@ describe("Windows services", () => {
       expect(command).toContain(options.path);
       expect(command).toContain("exit $LASTEXITCODE");
       expect(command).not.toContain("Start-Process");
+      // A healthy server logging to stderr must not terminate its wrapper.
+      expect(command).toContain("$ErrorActionPreference = 'Continue'");
+      expect(command).not.toContain("$ErrorActionPreference = 'Stop'");
+      // A real crash must still surface a failure exit code for RestartOnFailure.
+      expect(command).toContain("if ($LASTEXITCODE -eq $null) { exit 1 }");
     }
     expect(definitions["CodexProxy.xml"]).toContain("<RestartOnFailure>");
     expect(definitions["CodexProxy.xml"]).toContain("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>");

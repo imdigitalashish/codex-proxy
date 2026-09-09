@@ -83,12 +83,16 @@ export function renderWindowsTasks(options: {
   const environment = { HOME: home, CODEX_HOME: codexHome, PATH: path };
   function task(script: string, log: string, repeat: boolean): string {
     const command = [
-      "$ErrorActionPreference = 'Stop'",
+      // The server writes progress to stderr. Under 'Stop', PowerShell turns that
+      // into a terminating NativeCommandError and kills a healthy proxy.
+      "$ErrorActionPreference = 'Continue'",
       ...Object.entries(environment).map(([key, value]) =>
         `[Environment]::SetEnvironmentVariable(${psLiteral(key)}, ${psLiteral(value)}, 'Process')`),
       "$env:CODEX_PROXY_TASK_PARENT_PID = [string]$PID",
       `Set-Location -LiteralPath ${psLiteral(installDir)}`,
       `& ${psLiteral(bunExecutable)} run ${psLiteral(win32.join(installDir, script))} 2>&1 | Out-File -LiteralPath ${psLiteral(win32.join(installDir, "logs", `${log}.log`))} -Append -Encoding utf8`,
+      // Report a real crash so Task Scheduler's RestartOnFailure policy applies.
+      "if ($LASTEXITCODE -eq $null) { exit 1 }",
       "exit $LASTEXITCODE",
     ].join("\n");
     const encoded = Buffer.from(command, "utf16le").toString("base64");
