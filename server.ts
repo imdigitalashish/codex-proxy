@@ -3,7 +3,7 @@
 // - Streams SSE untouched for Responses-native models; translates Responses <-> Chat Completions for models the
 //   upstream only serves on /chat/completions (Claude, Gemini, ...) so Codex tools/subagents work on them too.
 // - Answers Codex clients' GET /v1/models in Codex's own schema: template models + generated entries for extra models.
-import { responsesToChat, chatToResponsesNonStream, chatStreamToResponsesStream, normalizeResponsesToolControls, sanitizeResponsesRequest, rewriteResponsesJson, rewriteResponsesSse, trimReasoningItems, ToolMappingError, type ToolIdentityMap } from "./responses-bridge.ts";
+import { responsesToChat, chatToResponsesNonStream, chatStreamToResponsesStream, normalizeResponsesToolControls, normalizeResponsesHistory, sanitizeResponsesRequest, rewriteResponsesJson, rewriteResponsesSse, trimReasoningItems, ToolMappingError, type ToolIdentityMap } from "./responses-bridge.ts";
 import { UploadGate, bodyBytes, drainSignalStream } from "./upload-gate.ts";
 import { buildCodexModels, isUsablePickerModel, supportsResponses, type CatalogEntry } from "./model-catalog.ts";
 import { COPILOT_MAX_BODY_BYTES, parseBodyLimit, assertBodyFits, RequestBodyTooLarge, bodyLimitResponse, codexRequestKind, readErrorPreview } from "./request-body-limit.ts";
@@ -266,6 +266,11 @@ async function forward(request: Request): Promise<Response> {
         log({ method: "POST", path: url.pathname, model, translated: true, reqKB, ...extraLog(), stream: false, initiator: tr.initiator, status: 200, ms: Date.now() - started, ua });
         return Response.json(out);
       }
+    }
+    // Keep the parsed history normalized too, so a retry cannot restore provider-specific item IDs.
+    if (path === "/responses" && request.method === "POST" && parsed) {
+      parsed = normalizeResponsesHistory(parsed);
+      body = JSON.stringify(parsed);
     }
     // Responses-native models from non-OpenAI vendors (Grok, mai-code) reject Codex's namespace/custom/web_search
     // tool types with a bare 422. Send them plain function tools and map custom-tool calls back in the stream.

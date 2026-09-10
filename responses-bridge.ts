@@ -140,6 +140,16 @@ export function normalizeResponsesToolControls(req: Json): Json {
   return request;
 }
 
+// Replayed tool item IDs belong to their originating provider; call_id pairs the call and output.
+export function normalizeResponsesHistory(req: Json): Json {
+  if (!Array.isArray(req?.input)) return req;
+  return { ...req, input: req.input.map((item: Json) => {
+    if (!["function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output"].includes(item?.type)) return item;
+    const { id: _id, ...history } = item;
+    return history;
+  }) };
+}
+
 // Normalize Responses requests for non-OpenAI backends. Their tool definitions are plain functions,
 // so historical calls to mapped custom tools must use the matching function-call item shapes too.
 export function sanitizeResponsesRequest(req: Json): SanitizedResponsesRequest {
@@ -455,6 +465,16 @@ export function chatStreamToResponsesStream(upstream: Response, req: Json, custo
         emit("error", { code: "upstream_error", message: errorText });
         emit("response.failed", { response: { ...base(), status: "failed", output: final, error: { code: "upstream_error", message: errorText } } });
         onDone?.({ status: "failed", error: errorText });
+      } else if (final.length === 0) {
+        const limited = finish === "length";
+        const status = limited ? "incomplete" : "failed";
+        const message = limited
+          ? "Upstream reached max_output_tokens before producing any output items (finish_reason=length)."
+          : `Upstream stream produced no output items (finish_reason=${finish ?? "absent"}).`;
+        const error = limited ? null : { code: "upstream_empty_output", message };
+        if (error) emit("error", error);
+        emit(`response.${status}`, { response: { ...base(), status, output: final, usage: usageToResponses(usage) ?? null, error, incomplete_details: limited ? { reason: "max_output_tokens" } : null } });
+        onDone?.({ status, error: message });
       } else {
         emit("response.completed", { response: { ...base(), status: "completed", output: final, usage: usageToResponses(usage) ?? { input_tokens: 0, output_tokens: 0, total_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } }, incomplete_details: finish === "length" ? { reason: "max_output_tokens" } : null } });
         onDone?.({ status: "completed" });

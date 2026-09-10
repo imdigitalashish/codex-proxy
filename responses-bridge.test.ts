@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
-  chatStreamToResponsesStream, chatToResponsesNonStream, flattenTools, normalizeResponsesToolControls,
+  chatStreamToResponsesStream, chatToResponsesNonStream, flattenTools, normalizeResponsesHistory, normalizeResponsesToolControls,
   responsesToChat, rewriteResponsesJson, rewriteResponsesSse, sanitizeResponsesRequest,
   ToolMappingError, trimReasoningItems, type FlatTools,
 } from "./responses-bridge.ts";
@@ -391,5 +391,73 @@ describe("trimReasoningItems", () => {
     expect(trimReasoningItems(req, 0)).toBe(0);
     expect(trimReasoningItems({ input: input() }, 5)).toBe(0);
     expect(trimReasoningItems({ input: "hello" }, 0)).toBe(0);
+  });
+});
+
+// Replaying a thread across vendors: history minted by one provider carries that
+// provider's item ids, which the next provider rejects (ctco_* where fc_* is expected).
+describe("normalizeResponsesHistory", () => {
+  const history = () => [
+    { role: "user", content: [{ type: "input_text", text: "go" }] },
+    { type: "reasoning", id: "rs_1", encrypted_content: "x" },
+    { type: "function_call", id: "fc_1", call_id: "c1", name: "shell", arguments: "{}" },
+    { type: "function_call_output", id: "fco_1", call_id: "c1", output: "ok" },
+    { type: "custom_tool_call", id: "ctc_1", call_id: "toolu_abc", name: "apply_patch", input: "patch" },
+    { type: "custom_tool_call_output", id: "ctco_1", call_id: "toolu_abc", output: "done" },
+  ];
+
+  test("drops tool item ids while preserving call_id pairing and every other field", () => {
+    const out = normalizeResponsesHistory({ model: "m", input: history() });
+    expect(out.input.map((i: any) => i.id)).toEqual([undefined, "rs_1", undefined, undefined, undefined, undefined]);
+    expect(out.input.map((i: any) => i.call_id)).toEqual([undefined, undefined, "c1", "c1", "toolu_abc", "toolu_abc"]);
+    expect(out.input[4]).toEqual({ type: "custom_tool_call", call_id: "toolu_abc", name: "apply_patch", input: "patch" });
+    expect(out.model).toBe("m");
+  });
+
+  test("leaves non-tool history untouched, is immutable, idempotent, and ignores non-array input", () => {
+    const req = { input: history() };
+    const once = normalizeResponsesHistory(req);
+    expect(req.input[4].id).toBe("ctc_1");
+    expect(normalizeResponsesHistory(once)).toEqual(once);
+    expect(normalizeResponsesHistory({ input: "hello" })).toEqual({ input: "hello" });
+  });
+});
+
+// An upstream stream that yields no output items is a failure, not a successful empty turn.
+describe("empty translated streams", () => {
+  const drain = async (events: any[]) => {
+    const seen: { status: string; error?: string }[] = [];
+    const stream = chatStreamToResponsesStream(sseResponse(events), { model: "m", stream: true }, new Set(), (info) => { seen.push(info); });
+    const text = await new Response(stream).text();
+    return { events: parseEvents(text), done: seen[0] };
+  };
+
+  test("reports an upstream anomaly when no output item and no finish reason arrive", async () => {
+    const { events, done } = await drain([{ choices: [{ delta: {} }] }, { usage: { prompt_tokens: 9, completion_tokens: 0 } }]);
+    const terminal = events.at(-1);
+    expect(terminal.type).toBe("response.failed");
+    expect(terminal.response.status).toBe("failed");
+    expect(terminal.response.error.code).toBe("upstream_empty_output");
+    expect(terminal.response.error.message).toContain("finish_reason=absent");
+    expect(events.some((e) => e.type === "response.completed")).toBe(false);
+    expect(done.status).toBe("failed");
+  });
+
+  test("reports a length limit when the model was cut off before emitting anything", async () => {
+    const { events, done } = await drain([{ choices: [{ delta: {}, finish_reason: "length" }] }]);
+    const terminal = events.at(-1);
+    expect(terminal.type).toBe("response.incomplete");
+    expect(terminal.response.status).toBe("incomplete");
+    expect(terminal.response.incomplete_details).toEqual({ reason: "max_output_tokens" });
+    expect(terminal.response.error).toBeNull();
+    expect(done.status).toBe("incomplete");
+  });
+
+  test("still completes normally when the stream produced text", async () => {
+    const { events, done } = await drain([{ choices: [{ delta: { content: "hi" }, finish_reason: "stop" }] }]);
+    const terminal = events.at(-1);
+    expect(terminal.type).toBe("response.completed");
+    expect(terminal.response.status).toBe("completed");
+    expect(done.status).toBe("completed");
   });
 });
